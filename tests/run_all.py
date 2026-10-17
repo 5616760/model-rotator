@@ -24,6 +24,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SUITES = [
     "test_watchdog.py",
+    "test_first_token.py",
     "test_quality_routing.py",
     "test_account_affinity.py",
     "test_endpoints.py",

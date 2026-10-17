@@ -14,7 +14,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class MockUpstream:
     def __init__(self, plan):
-        """plan: {model_id: {"delay": 秒, "status": 200, "body": str|None}}"""
+        """plan: {model_id: {"delay": 秒, "status": 200, "body": str|None,
+                             "stream": bool, "ttft": 秒}}
+
+        - delay: 响应头（含首 token，非流式时整个 body）之前的等待
+        - stream+ttft: 流式时响应头立即下发，首个数据块延迟 ttft 秒 ——
+          专门用来模拟「响应头很快、首 token 迟迟不来」的沉默上游。
+        """
         self.plan = plan
         self.hits = {}
         self.lock = threading.Lock()
@@ -67,6 +73,28 @@ class MockUpstream:
                         "usage": {"prompt_tokens": 1, "completion_tokens": 1,
                                   "total_tokens": 2},
                     }).encode()
+                if conf.get("stream"):
+                    # 流式：立即回响应头，首 token 数据块延迟 ttft 秒
+                    self.send_response(code)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    ttft = conf.get("ttft", 0)
+                    if ttft:
+                        time.sleep(ttft)
+                    lines = [b'data: {"id":"mock","object":"chat.completion.chunk",'
+                             b'"model":"%s","choices":[{"index":0,"delta":'
+                             b'{"content":"hi"}}]}\n\n' % mid.encode()]
+                    try:
+                        for l in lines:
+                            self.wfile.write(l)
+                            self.wfile.flush()
+                        self.wfile.write(b'data: [DONE]\n\n')
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError,
+                            ConnectionAbortedError, OSError):
+                        pass
+                    return
                 try:
                     self.send_response(code)
                     self.send_header("Content-Type", "application/json")

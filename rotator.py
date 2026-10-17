@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import socket
 import ssl
 import sys
 import threading
@@ -548,6 +549,38 @@ def urlopen_direct(req, timeout):
     return _OPENER.open(req, timeout=timeout)
 
 
+def resp_socket(resp):
+    """拿到 urllib response 的底层 socket（读超时要用）。拿不到就返回 None。"""
+    fp = getattr(resp, "fp", None)
+    raw = getattr(fp, "raw", None)
+    return getattr(raw, "_sock", None)
+
+
+def read_first_chunk(resp, timeout):
+    """带超时读流式响应的第一个数据块（= 首 token）。
+
+    上游 socket 的 timeout 语义是「无数据多久断开」，正好等价于
+    「首 token 迟迟不来就放弃」：把 timeout 临时设到 socket 上读一次，
+    读到（或对端正常关闭，返回 b''）后立刻恢复原值。
+
+    超时抛 socket.timeout，由调用方判死走 fallback。
+    """
+    if not timeout or timeout <= 0:
+        return resp.read(8192)
+    sock = resp_socket(resp)
+    if sock is None:
+        return resp.read(8192)
+    old = sock.gettimeout()
+    sock.settimeout(timeout)
+    try:
+        return resp.read(8192)
+    finally:
+        try:
+            sock.settimeout(old)
+        except Exception:
+            pass
+
+
 # ------------------------------------------------------------------- watchdog  #
 class Attempt:
     """一次上游尝试，跑在独立线程里，外部可以「只等 N 秒就先走」。
@@ -702,6 +735,7 @@ class Handler(BaseHTTPRequestHandler):
         _hedge_extra = set()                # 对冲额外名额，供 finally 兜底释放
         hedge_after = float(CFG.get("hedge_after_seconds") or 0)
         hedge_max = int(CFG.get("hedge_max") or 0)
+        first_token_to = float(CFG.get("first_token_timeout_seconds") or 0)
 
         def make_attempt(i):
             """按池下标构造一次上游尝试（body 里的 model 已改写）。"""
@@ -741,8 +775,27 @@ class Handler(BaseHTTPRequestHandler):
             return "return", None
 
         def succeed(cur_idx, resp, t0, tag):
+            """响应头到手后的最后一道关：流式先等首 token，超时判死换路。
+
+            返回 (True, None) 表示已开始正常透传（含客户端中途断开）；
+            返回 (False, chain) 表示首 token 超时，chain 是下一条 fallback 链。
+            判死只可能发生在给客户端写第一个字节之前 —— 一旦开始写就不能换。
+            """
+            member = ST.pool[cur_idx]
+            head = None
+            if stream and first_token_to > 0:
+                try:
+                    head = read_first_chunk(resp, first_token_to)
+                except (socket.timeout, TimeoutError):
+                    log.warning("看门狗: %s 响应头后 %.0fs 无首 token，判死走 fallback",
+                                member["id"], first_token_to)
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    return False, ST.mark_fail(cur_idx, "first_token_timeout")
             ST.mark_ok(cur_idx)
-            self._relay(resp, stream)
+            self._relay(resp, stream, head=head)
             log.info("routed sid=%s model=%s acct=%s inflight=%s stream=%s tools=%s "
                      "attempts=%s ep=%s %s",
                      (sid or "")[:18], ST.pool[cur_idx]["id"],
@@ -751,6 +804,7 @@ class Handler(BaseHTTPRequestHandler):
                      bool(parsed.get("tools")), len(tried) + 1,
                      path.rsplit("/", 1)[-1],
                      "%s %.1fs" % (tag, time.time() - t0))
+            return True, None
 
         try:
             for probe_i in range(len(ST.pool) + 2):
@@ -786,8 +840,11 @@ class Handler(BaseHTTPRequestHandler):
                             return
                         attempt_chain = chain
                         continue
-                    succeed(cur_idx, resp, t0, "OK")
-                    return
+                    ok, fchain = succeed(cur_idx, resp, t0, "OK")
+                    if ok:
+                        return
+                    attempt_chain = fchain
+                    continue
 
                 # ---- 慢：进入条件对冲 ----
                 # racers 里的每一路都在独立线程里等响应头；谁先拿到就用谁，
@@ -872,8 +929,13 @@ class Handler(BaseHTTPRequestHandler):
                         ST.release(held)
                         extra.discard(win_idx)
                         held = win_idx
-                    succeed(win_idx, resp, t0, "OK(hedged x%d)" % len(used))
-                    return
+                    ok, fchain = succeed(win_idx, resp, t0,
+                                         "OK(hedged x%d)" % len(used))
+                    if ok:
+                        return
+                    # 赢家首 token 超时：落败路已全部放弃，交给外层 fallback 链
+                    attempt_chain = fchain
+                    break
                 continue
 
             # 全部候选失败
@@ -891,7 +953,7 @@ class Handler(BaseHTTPRequestHandler):
             _hedge_extra.clear()
 
     # ---- 透传上游响应（流式逐块，非流式读满） ----
-    def _relay(self, resp, stream):
+    def _relay(self, resp, stream, head=None):
         # 上游的 Content-Length / Transfer-Encoding 必须丢弃，由本层按实际转发方式
         # 重新计算；沿用上游头会和下面手动设置的长度冲突，导致客户端收到畸形响应。
         SKIP = HOP_BY_HOP | {"set-cookie", "content-length"}
@@ -909,8 +971,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("X-Accel-Buffering", "no")
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
+                pending = head   # 首 token 判死阶段预读出来的第一块，先吐给客户端
                 while True:
-                    chunk = resp.read(8192)
+                    chunk = pending if pending is not None else resp.read(8192)
+                    pending = None
                     if not chunk:
                         break
                     self.wfile.write(b"%x\r\n" % len(chunk))
