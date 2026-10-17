@@ -41,7 +41,12 @@ import urllib.request
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    # PyInstaller onefile/onedir 打包运行：__file__ 指向 _MEIPASS 临时解压目录，
+    # 真正的用户数据目录是 exe 所在目录。
+    HERE = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CFG = os.path.join(HERE, "config.json")
 SESSION_TTL = 6 * 3600          # 会话 ID 多久不活动就重绑模型（秒）
 MAX_REQ_BYTES = 64 * 1024 * 1024  # 请求体上限，超出直接拒（防内存爆）
@@ -85,16 +90,78 @@ def load_raw(path):
         return json.load(f)
 
 
+def _resource_path(name):
+    """返回捆绑数据文件（config.example.json 等）的实际路径。
+
+    PyInstaller onefile 模式下捆绑数据在 sys._MEIPASS，onedir 在 exe 同目录的
+    _internal；源码运行就在脚本目录。exe 打包时用 --add-data 指定。
+    """
+    base = getattr(sys, "_MEIPASS", HERE)
+    p = os.path.join(base, name)
+    if os.path.isfile(p):
+        return p
+    # 回退：源码目录 / exe 目录下的同名文件（onedir / 开发态）
+    for d in (HERE, os.path.dirname(os.path.abspath(__file__))):
+        p2 = os.path.join(d, name)
+        if os.path.isfile(p2):
+            return p2
+    return None
+
+
+def bootstrap_config():
+    """确保 config.json 存在；不存在则用捆绑的 config.example.json 生成一份。"""
+    if os.path.exists(DEFAULT_CFG):
+        return DEFAULT_CFG
+    example = _resource_path("config.example.json")
+    if not example:
+        raise SystemExit(
+            "未找到 config.json，且无 config.example.json 模板可复制。\n"
+            "请参照 README 手动创建 config.json。")
+    try:
+        with open(example, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        with open(DEFAULT_CFG, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(
+            "[rotator] 首次运行：已用 config.example.json 生成 %s\n"
+            "           请编辑该文件，把 pool 里的 url/key 换成你自己的上游模型；\n"
+            "           source_models_json 指向你的 models.json（WorkBuddy 默认）。"
+            % DEFAULT_CFG,
+            file=sys.stderr)
+    except OSError as e:
+        raise SystemExit("无法写入配置文件 %s: %s" % (DEFAULT_CFG, e))
+    return DEFAULT_CFG
+
+
 def build_config():
+    bootstrap_config()
     cfg = load_raw(DEFAULT_CFG)
     src = cfg.get("source_models_json",
                   os.path.expanduser("~/.workbuddy/models.json"))
-    models = load_raw(src)
-    by_id = {m["id"]: m for m in models}
-    pool = []
-    # 每个模型的显式质量分（0-100，越大越好）。未写的模型按 50 处理。
-    # 用 quality_priority=false 可整体退回「纯时间窗轮换」的旧行为。
     scores = cfg.get("quality_scores") or {}
+
+    # 按需加载 models.json：仅当池里有「字符串形式的模型 id」或「key_from 引用」
+    # 时才需要它。全内联 url/key 的配置不需要外部文件（exe 分发场景友好）。
+    needs_src = False
+    for entry in cfg["pool"]:
+        if isinstance(entry, str):
+            needs_src = True
+            break
+        if isinstance(entry, dict) and entry.get("key_from"):
+            needs_src = True
+            break
+
+    by_id = {}
+    if needs_src:
+        if not os.path.exists(src):
+            raise SystemExit(
+                "池里用了字符串模型 id 或 key_from，但找不到模型清单文件：%s\n"
+                "请把 source_models_json 指向正确的 models.json，或改用内联写法\n"
+                '{"id":"...","url":"...","key":"..."}。' % src)
+        models = load_raw(src)
+        by_id = {m["id"]: m for m in models}
+
+    pool = []
     for entry in cfg["pool"]:
         # 轻量写法 "model-id@account"：给池成员标上游账号，并发时按账号分片。
         # 不写 @ 时账号默认等于模型 id（每个模型自成一组）。

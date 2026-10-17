@@ -1,0 +1,72 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"           # 推送 v1.0.0 等标签时触发
+  workflow_dispatch:    # 允许手动触发（输入版本号）
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write       # 创建 GitHub Release 并上传资产
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+
+      - name: Run tests
+        run: python tests/run_all.py
+
+      - name: Build single-file exe
+        run: python build_exe.py --clean
+
+      - name: Verify artifact exists
+        shell: bash
+        run: |
+          ls -lh dist/ModelRotator.exe
+          file dist/ModelRotator.exe || true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ModelRotator ${{ github.event.inputs.tag || github.ref_name }}
+          body: |
+            ## ModelRotator — 本地 OpenAI 兼容模型轮换代理
+
+            下载 `ModelRotator.exe` 后双击运行；首次启动会在 exe 同目录生成
+            `config.json`，编辑填入你自己的上游模型后重启即可。
+
+            ### Windows SmartScreen 提示
+            未签名 exe 首次运行会弹「Windows 已保护你的电脑」，点「更多信息 → 仍要运行」即可。
+
+            ### 使用说明
+            - 见仓库 README
+            - 配置文件：exe 同目录 `config.json`
+            - 日志：exe 同目录 `rotator.log`
+            - 默认监听：`http://127.0.0.1:3166`
+
+            ### 校验
+            本 Release 的 exe 由 GitHub Actions 在 Windows runner 上从该 tag 的源码构建，
+            构建日志可在 Actions 页查看。
+          files: |
+            dist/ModelRotator.exe
+            config.example.json
+          draft: false
+          prerelease: ${{ contains(github.event.inputs.tag || github.ref_name, '-') }}

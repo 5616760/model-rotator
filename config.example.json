@@ -42,12 +42,6 @@
       "url": "http://127.0.0.1:8080/v1",
       "key": "",
       "account": "local"
-    },
-    {
-      "id": "my-model",
-      "url": "http://127.0.0.1:9000/v1",
-      "key_from": "gpt-4o-mini",
-      "account": "openai"
     }
   ]
 }

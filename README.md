@@ -79,6 +79,37 @@ curl http://127.0.0.1:3166/health
 
 客户端把 `base_url` 设为 `http://127.0.0.1:3166/v1`，`model` 设为 `config.json` 里的 `expose_as`（示例为 `AutoRotate`），`api_key` 随便填（代理不校验客户端 key）。
 
+## 分发：单文件 EXE（Windows）
+
+不想装 Python？直接给一台 Windows 机器发一个 `ModelRotator.exe` 就能用（GitHub Releases 页面有预构建产物）。
+
+```powershell
+# 在源码目录（需要 Python 环境）本地构建：
+pip install pyinstaller
+python build_exe.py           # 产物: dist/ModelRotator.exe (~9.6 MB, 单文件)
+python build_exe.py --console # 保留控制台窗口，方便看日志
+```
+
+**分发与首次使用**：
+
+1. 把 `ModelRotator.exe` 复制到接收方机器的任意目录（建议 `C:\tools\ModelRotator\`）；
+2. 双击运行——首次启动会自动在 exe 同目录生成一份 `config.json`（基于内置的 `config.example.json` 模板）；
+3. 编辑 `config.json`，把 `pool` 里的 `url`/`key` 换成你自己的上游模型（或用字符串 id 引用 `models.json`）；
+4. 重新运行 exe，服务即监听默认 `127.0.0.1:3166`；
+5. 客户端 `base_url` 填 `http://127.0.0.1:3166/v1`，`model` 填 `AutoRotate`。
+
+**GitHub Actions 自动发布**：打 `vX.Y.Z` 标签推送后，仓库的 `.github/workflows/release.yml` 会在 Windows runner 上跑测试 + 构建 exe + 创建 Release 并挂载 `ModelRotator.exe` 与 `config.example.json` 资产。
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+# Actions 完成 => 自动生成 Release，exe 可下载
+```
+
+> **SmartScreen 提示**：未签名的 exe 首次运行会弹「Windows 已保护你的电脑」，点「更多信息 → 仍要运行」即可。正式分发建议申请代码签名证书（如 DigiCert / Sectigo EV）对 exe 签名。
+
+> **说明**：exe 由 PyInstaller 从同一个 `rotator.py` 打包，行为与源码版完全一致；配置文件、日志都写在 exe 所在目录（不是临时解压目录），升级/迁移只需搬 exe + config.json。
+
 ## 配置（`config.json`）
 
 | 字段 | 说明 | 默认 |
