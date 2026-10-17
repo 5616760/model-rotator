@@ -9,6 +9,17 @@ import os
 import subprocess
 import sys
 
+# Windows runner 默认 cp1252, 直接 print 中文会 UnicodeEncodeError
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except AttributeError:
+    pass
+
+# 子进程（各 test_*.py）也强制 UTF-8，避免继承 cp1252
+_CHILD_ENV = dict(os.environ)
+_CHILD_ENV["PYTHONIOENCODING"] = "utf-8"
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SUITES = [
@@ -29,8 +40,8 @@ def main():
             continue
         print("=" * 70)
         print("[RUN ] %s" % name)
-        r = subprocess.run([sys.executable, path], cwd=ROOT,
-                           capture_output=True, text=True)
+        r = subprocess.run([sys.executable, path], cwd=ROOT, env=_CHILD_ENV,
+                           capture_output=True, text=True, encoding="utf-8")
         tail = (r.stdout or "") + (r.stderr or "")
         print(tail[-4000:])
         if r.returncode == 0:
