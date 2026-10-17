@@ -97,6 +97,7 @@ def build_config():
                 "url": entry["url"].rstrip("/") + "/chat/completions"
                       if "/chat/completions" not in entry["url"] else entry["url"],
                 "key": entry.get("key", "") or src_key,
+                "account": entry.get("account") or entry["id"],
                 "meta": entry.get("meta", {}),
             })
             continue
@@ -107,6 +108,7 @@ def build_config():
             "id": entry,
             "url": m["url"].rstrip("/") + "/chat/completions",
             "key": m.get("apiKey") or "",
+            "account": entry,
             "meta": {
                 "vendor": m.get("vendor"),
                 "supportsToolCall": m.get("supportsToolCall"),
@@ -175,6 +177,38 @@ class State:
                 return i
         return None
 
+    def _account_of(self, idx):
+        return self.pool[idx].get("account") or self.pool[idx]["id"]
+
+    def _used_accounts(self, exclude_sid):
+        """当前其它粘性会话占用的账号计数（sid 集合为 self.sessions: sid->(idx,win)）。"""
+        used = {}
+        for s, (i, _w) in self.sessions.items():
+            if s == exclude_sid:
+                continue
+            a = self._account_of(i)
+            used[a] = used.get(a, 0) + 1
+        return used
+
+    def _pick_account_locked(self, exclude_sid, start):
+        """选一个「账号」尽量不与其它会话冲突的模型；空闲时即 start（cur）。
+        用于并发任务按账号分片：同时跑的任务落到不同账号，避免单账号被并发打满。"""
+        used = self._used_accounts(exclude_sid)
+        best = None
+        best_score = None
+        for off in range(self.n):
+            i = (start + off) % self.n
+            if not self._avail_locked(i):
+                continue
+            a = self._account_of(i)
+            score = (used.get(a, 0), off)   # 优先没被占用的账号，其次离 cur 最近
+            if best_score is None or score < best_score:
+                best_score = score
+                best = i
+                if used.get(a, 0) == 0 and off == 0:
+                    return i
+        return best
+
     def current(self):
         with self.lock:
             return self.pool[self._window_locked()]["id"]
@@ -196,12 +230,12 @@ class State:
             target = self.cur
             if entry is None and not self.rotate_on_first:
                 target = 0
-            idx = self._pick_locked(target)
+            idx = self._pick_account_locked(sid, target)
             cleared = False
             if idx is None:        # 池内全冷却 -> 清冷却重试一轮
                 log.warning("池内全部处于冷却，清除冷却后重试一轮")
                 self.cooldown.clear()
-                idx = self._pick_locked(target)
+                idx = self._pick_account_locked(sid, target)
                 cleared = True
             if idx is None:
                 idx = self.cur

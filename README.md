@@ -91,6 +91,7 @@ curl http://127.0.0.1:3166/health
 | `source_models_json` | 密钥源文件（WorkBuddy 风格的 `models.json`，提供 `apiKey`） | `~/.workbuddy/models.json` |
 | `pool` | 上游模型池，见下方三种写法 | 必填 |
 | `expose_as` | 对客户端暴露的模型名 | `AutoRotate` |
+| `account` | 池成员所属账号标签（可选，用于并发分片；缺省按模型 id 分桶） | 模型 id |
 | `log_file` | 日志路径；省略则写到程序目录 `rotator.log` | 程序目录 |
 
 ### 池成员（`pool`）的三种写法
@@ -109,6 +110,8 @@ curl http://127.0.0.1:3166/health
 ```
 
 > 形式 1/3 依赖 `source_models_json`（典型如 WorkBuddy 的 `~/.workbuddy/models.json`）。形式 2 完全自包含，适合对接任意 OpenAI 兼容网关。
+
+**并发分片（按账号）**：每个成员可带 `account` 字段标记所属上游账号。同一时刻多个会话会被尽量分配到**不同 `account`** 的模型上，避免并发任务打满同一个账号；单会话仍按时间窗轮换，不会永久钉死。不写 `account` 时默认按模型 id 分桶，也能实现「并发任务用不同模型」。同一账号的多个模型可共用一个 `account` 名，让代理把它们视为同一资源、避免并发挤在一起。
 
 ## 控制脚本（Windows）
 

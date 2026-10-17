@@ -20,17 +20,26 @@
     {
       "id": "gpt-4o-mini",
       "url": "https://api.openai.com/v1",
-      "key": "sk-REPLACE_WITH_YOUR_KEY"
+      "key": "sk-REPLACE_WITH_YOUR_KEY",
+      "account": "openai"
     },
     {
       "id": "claude-3-5-haiku-latest",
       "url": "https://api.anthropic.com/v1",
-      "key": "sk-ant-REPLACE_WITH_YOUR_KEY"
+      "key": "sk-ant-REPLACE_WITH_YOUR_KEY",
+      "account": "anthropic"
     },
     {
       "id": "local-model",
       "url": "http://127.0.0.1:8080/v1",
-      "key": ""
+      "key": "",
+      "account": "local"
+    },
+    {
+      "id": "my-model",
+      "url": "http://127.0.0.1:9000/v1",
+      "key_from": "gpt-4o-mini",
+      "account": "openai"
     }
   ]
 }
