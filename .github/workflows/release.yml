@@ -16,6 +16,8 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      PYTHONIOENCODING: utf-8   # Windows runner 默认 cp1252, 中文字符串会崩
 
     steps:
       - uses: actions/checkout@v4
@@ -31,8 +33,6 @@ jobs:
           pip install pyinstaller
 
       - name: Run tests
-        env:
-          PYTHONIOENCODING: utf-8
         run: python tests/run_all.py
 
       - name: Build single-file exe

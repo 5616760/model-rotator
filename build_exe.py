@@ -17,6 +17,13 @@ import shutil
 import subprocess
 import sys
 
+# Windows 默认 cp1252, 中文 print 会 UnicodeEncodeError
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except AttributeError:
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_NAME = "ModelRotator"
 ENTRY = os.path.join(HERE, "rotator.py")
