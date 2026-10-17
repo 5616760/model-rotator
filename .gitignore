@@ -1,0 +1,29 @@
+# ---- Personal / local config -------------------------------------------------
+# Your real config lives at config.json (copy from config.example.json and edit).
+# It is intentionally NOT tracked so secrets and machine-specific paths never leak.
+config.json
+
+# ---- Logs --------------------------------------------------------------------
+*.log
+rotator.log
+
+# ---- Backups -----------------------------------------------------------------
+*.bak
+*.bak*
+
+# ---- Probe output (machine-specific capability scan) --------------------------
+probe_result.json
+
+# ---- Secrets / environment ---------------------------------------------------
+.env
+
+# ---- Python ------------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- OS / editor -------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

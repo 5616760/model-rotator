@@ -1,0 +1,36 @@
+{
+  "listen_host": "127.0.0.1",
+  "listen_port": 3166,
+  "rotate_minutes": 30,
+  "cooldown_minutes": 10,
+  "fail_status": [
+    408,
+    409,
+    425,
+    429,
+    500,
+    502,
+    503,
+    504
+  ],
+  "fail_on_exception": true,
+  "rotate_on_first_request": true,
+  "expose_as": "AutoRotate",
+  "pool": [
+    {
+      "id": "gpt-4o-mini",
+      "url": "https://api.openai.com/v1",
+      "key": "sk-REPLACE_WITH_YOUR_KEY"
+    },
+    {
+      "id": "claude-3-5-haiku-latest",
+      "url": "https://api.anthropic.com/v1",
+      "key": "sk-ant-REPLACE_WITH_YOUR_KEY"
+    },
+    {
+      "id": "local-model",
+      "url": "http://127.0.0.1:8080/v1",
+      "key": ""
+    }
+  ]
+}
