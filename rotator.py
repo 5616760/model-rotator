@@ -138,9 +138,10 @@ class State:
         self.cooldown_s = cooldown_s
         self.rotate_on_first = rotate_on_first
         self.cur = 0
+        self.win_idx = 0            # 时间窗序号，每推进一个窗口 +1
         self.win_start = time.time()
         self.cooldown = {}          # idx -> until_ts
-        self.sessions = OrderedDict()  # sid -> idx
+        self.sessions = OrderedDict()  # sid -> (idx, win_idx)
         self.stats = {}              # idx -> {ok, fail, fail_types:{}}
         for i in range(self.n):
             self.stats[i] = {"ok": 0, "fail": 0, "fail_types": {}}
@@ -153,6 +154,7 @@ class State:
             steps = int(elapsed // self.rotate_s)
             self.cur = (self.cur + steps) % self.n
             self.win_start += steps * self.rotate_s
+            self.win_idx += steps
             log.info("时间窗推进 %d 步，轮换 -> %s", steps, self.pool[self.cur]["id"])
         return self.cur
 
@@ -181,14 +183,18 @@ class State:
     def resolve(self, sid):
         with self.lock:
             self._window_locked()
-            target = self.cur
-            sticky = self.sessions.get(sid)
-            if sticky is not None:
-                if self._avail_locked(sticky):
+            win_idx = self.win_idx
+            entry = self.sessions.get(sid) if sid is not None else None
+            if entry is not None:
+                bound_idx, bound_win = entry
+                # 粘性只在「同一时间窗」内生效：跨窗则释放，跟随轮换到当前窗模型；
+                # 绑定模型若在冷却也释放，从当前窗重新选。避免长会话被永久钉死。
+                if bound_win == win_idx and self._avail_locked(bound_idx):
+                    self.sessions[sid] = (bound_idx, bound_win)
                     self.sessions.move_to_end(sid)
-                    return sticky, False
-                target = sticky   # 从原绑定继续往后找，尽量贴近会话上下文
-            elif not self.rotate_on_first:
+                    return bound_idx, False
+            target = self.cur
+            if entry is None and not self.rotate_on_first:
                 target = 0
             idx = self._pick_locked(target)
             cleared = False
@@ -200,7 +206,7 @@ class State:
             if idx is None:
                 idx = self.cur
             if sid is not None:
-                self.sessions[sid] = idx
+                self.sessions[sid] = (idx, win_idx)
                 while len(self.sessions) > 4096:
                     self.sessions.popitem(last=False)
             return idx, cleared
@@ -466,8 +472,6 @@ class Handler(BaseHTTPRequestHandler):
             # 成功：透传
             ST.mark_ok(cur_idx)
             self._relay(resp, stream)
-            with ST.lock:
-                bound = ST.sessions.get(sid)
             log.info("routed sid=%s model=%s stream=%s tools=%s attempts=%s %s",
                      (sid or "")[:18], member["id"], stream,
                      bool(parsed.get("tools")), len(tried) + 1,
