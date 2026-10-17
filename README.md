@@ -14,7 +14,7 @@ ModelRotator 在它们之上再放一层：
 
 - 客户端只配置一个 `AutoRotate` 模型，指向本代理；
 - 代理按「时间窗轮换 + 失败自动跳过并冷却」把请求路由到池内真实模型；
-- 对客户端完全透明（标准 `/v1/chat/completions` + SSE 流式透传）。
+- 对客户端完全透明（标准 `/v1/chat/completions` 与 `/v1/responses`，均支持 SSE 流式透传）。
 
 ## 特性
 
@@ -186,6 +186,19 @@ powershell -ExecutionPolicy Bypass -File rotator-ctl.ps1 testautostart # 停→�
 ```
 
 脚本自动定位 `pythonw.exe`：优先 `$env:PYTHONW` → 已注册计划任务里的解释器 → PATH 上的 `pythonw` → 否则回退 `pythonw.exe`。macOS / Linux 可去掉计划任务部分，直接用 `nohup python rotator.py &` 或 systemd 保活。
+
+## 支持的请求端点
+
+转发层支持同一 base 下的多个 OpenAI 兼容端点，共用同一套路由、冷却与失败转移：
+
+| 客户端请求 | 转发到上游 | 说明 |
+|-----------|-----------|------|
+| `POST /v1/chat/completions` | `<base>/v1/chat/completions` | 对话补全，SSE 流式透传 |
+| `POST /v1/responses` | `<base>/v1/responses` | OpenAI Responses API，SSE 事件流透传 |
+
+两者都靠 body 里的 `model` 字段改写完成路由，`stream: true` 都走 SSE 透传，因此不需要格式转换。请求路径会去掉 query string 再判定（`/v1/responses?api-version=...` 可用），未知端点仍返回 404 并列出 `supported`。
+
+> 注意：上游 URL 是按 `/v1/` 为锚点整体重建的。池成员的 url 固定存成 `.../v1/chat/completions`，若只替换最后一段会拼出 `/v1/chat/responses`（错误），所以 `upstream_url()` 保留 base 前缀、只换 `/v1/` 之后的部分。
 
 ## 健康检查与状态
 

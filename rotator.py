@@ -46,6 +46,11 @@ DEFAULT_CFG = os.path.join(HERE, "config.json")
 SESSION_TTL = 6 * 3600          # 会话 ID 多久不活动就重绑模型（秒）
 MAX_REQ_BYTES = 64 * 1024 * 1024  # 请求体上限，超出直接拒（防内存爆）
 
+# 允许转发的 OpenAI 兼容端点。除 /v1/chat/completions 外，WorkBuddy 的部分
+# agent/工具走新的 Responses API（/v1/responses）；上游 agent2api 同样支持，
+# 两者请求体都用 model 字段、都支持 stream，故共用同一套路由与失败转移。
+SUPPORTED_POST_PATHS = ("/v1/chat/completions", "/v1/responses")
+
 log = logging.getLogger("rotator")
 START_TS = time.time()
 HOP_BY_HOP = {"content-length", "transfer-encoding", "connection", "keep-alive",
@@ -404,6 +409,21 @@ def scrub(text):
     return text
 
 
+def upstream_url(member_url, client_path):
+    """把池成员保存的端点换算成客户端实际请求的那个端点（同 base 下）。
+
+    池里的 url 在建池时就固定成了 ".../v1/chat/completions"。客户端如果请求
+    /v1/responses，必须把 "/v1/..." 整段换掉，否则会把 Responses 请求体发给
+    chat/completions —— 上游会按对话补全解析 input 字段并报 400。
+
+    注意不能只替换最后一段：chat/completions 有两级路径，只换末段会得到
+    /v1/chat/responses（错误）。这里以 "/v1/" 为锚点整体重建。
+    """
+    idx = member_url.find("/v1/")
+    base = member_url[:idx] if idx >= 0 else member_url.rsplit("/", 2)[0]
+    return base + "/v1/" + client_path.split("/v1/", 1)[-1]
+
+
 def build_upstream_request(url, body_bytes, auth_key, extra_headers):
     headers = {}
     for k, v in extra_headers.items():
@@ -490,9 +510,12 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
-        if not self.path.startswith("/v1/chat/completions"):
+        # 去掉 query string，只按路径判断（有些客户端会带 ?api-version=）
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if path not in SUPPORTED_POST_PATHS:
             self._json(404, {"error": {"message": "unsupported endpoint: %s" % self.path,
-                                       "type": "http_error"}})
+                                       "type": "http_error",
+                                       "supported": list(SUPPORTED_POST_PATHS)}})
             return
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -539,7 +562,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 extra = {k: v for k, v in self.headers.items()}
                 req = build_upstream_request(
-                    member["url"], body_bytes, member["key"], extra)
+                    upstream_url(member["url"], path), body_bytes, member["key"], extra)
 
                 t0 = time.time()
                 try:
@@ -572,11 +595,12 @@ class Handler(BaseHTTPRequestHandler):
                 # 成功：透传
                 ST.mark_ok(cur_idx)
                 self._relay(resp, stream)
-                log.info("routed sid=%s model=%s acct=%s inflight=%s stream=%s tools=%s attempts=%s %s",
+                log.info("routed sid=%s model=%s acct=%s inflight=%s stream=%s tools=%s attempts=%s ep=%s %s",
                          (sid or "")[:18], member["id"],
                          ST.pool[cur_idx].get("account") or "-",
                          ST.inflight_count(), stream,
                          bool(parsed.get("tools")), len(tried) + 1,
+                         path.rsplit("/", 1)[-1],
                          "OK %.1fs" % (time.time() - t0))
                 return
 
