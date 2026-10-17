@@ -29,15 +29,30 @@ ModelRotator 在它们之上再放一层：
 
 ## 工作原理
 
+```mermaid
+flowchart LR
+    C["OpenAI-compatible client<br/>model = AutoRotate"] -->|POST /v1/chat/completions| MR["ModelRotator<br/>127.0.0.1:3166"]
+    MR -->|"time-window rotate + failover"| P[("Pool of real models")]
+    P --> A["Model A<br/>base_url + key"]
+    P --> B["Model B<br/>base_url + key"]
+    P --> C2["Model C …"]
 ```
-客户端 ──► ModelRotator (127.0.0.1:3166)
-                │
-                ├─ 时间窗轮换：每 N 分钟切下一个模型
-                ├─ 会话粘性：同一 session 在窗内粘住同一模型
-                └─ 失败转移：429/5xx/异常 → 冷却 → 改投下一个
-                          │
-                          ▼
-            池内真实模型 A / B / C / …（各自 base_url + key）
+
+**一次失败转移（429 → 冷却 → 改投）的时序：**
+
+```mermaid
+sequenceDiagram
+    participant Cl as Client
+    participant MR as ModelRotator
+    participant M1 as Model A (active)
+    participant M2 as Model B (next)
+    Cl->>MR: chat/completions (session=X)
+    MR->>M1: forward (window model)
+    M1-->>MR: 429 / 5xx
+    MR->>MR: mark A cooldown, pick next available
+    MR->>M2: forward (fallback)
+    M2-->>MR: 200 (stream / JSON)
+    MR-->>Cl: relay transparently
 ```
 
 路由策略：
