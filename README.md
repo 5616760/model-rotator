@@ -24,6 +24,7 @@ ModelRotator 在它们之上再放一层：
 - **池内全冷却**：清除冷却重试一轮；仍不行则返回 429 并带 `X-Rotate-Reason`。
 - **完整透传**：流式 SSE / chunked 与非流式 JSON 都原样转发；逐条携带各自的 `base_url` 与 `api_key`。
 - **会话粘性（窗内）**：同一 `X-Rotate-Session` / `user` 在**一个时间窗内**恒定路由到同一模型，避免多轮对话上下文跨模型跳变；窗口到点后该会话自动跟随轮换（不会永久钉死在首个模型）。
+- **并发按账号分片**：同一时刻有多个任务在跑时，按各 `account` 的在途请求数分流，把并发摊到不同上游账号；顺序请求仍保持粘性。多个任务共用一个默认会话也照样分开。
 - **单实例保护**：启动前先探测本机端口健康，已有实例在跑则主动退出，避免端口互抢。
 - **只读上游清单**：从 `source_models_json` 读取密钥，绝不回写。
 
@@ -101,8 +102,12 @@ curl http://127.0.0.1:3166/health
   // 1) 仅写 id：从 source_models_json 里取该模型的 url + api_key
   "gpt-4o-mini",
 
+  // 1b) id@账号：同上，并标记它属于哪个上游账号（用于并发分片）
+  "gpt-4o-mini@openai-main",
+  "qwen-max@dashscope-a",
+
   // 2) 内联 url + 显式 key（自包含，不需要 source_models_json）
-  { "id": "claude-3-5-haiku", "url": "https://api.anthropic.com/v1", "key": "sk-ant-..." },
+  { "id": "claude-3-5-haiku", "url": "https://api.anthropic.com/v1", "key": "sk-ant-...", "account": "anthropic" },
 
   // 3) 内联 url + 借用密钥：key 从 source_models_json 里某个 id 的 apiKey 取
   { "id": "my-model", "url": "http://127.0.0.1:9000/v1", "key_from": "gpt-4o-mini" }
@@ -111,7 +116,21 @@ curl http://127.0.0.1:3166/health
 
 > 形式 1/3 依赖 `source_models_json`（典型如 WorkBuddy 的 `~/.workbuddy/models.json`）。形式 2 完全自包含，适合对接任意 OpenAI 兼容网关。
 
-**并发分片（按账号）**：每个成员可带 `account` 字段标记所属上游账号。同一时刻多个会话会被尽量分配到**不同 `account`** 的模型上，避免并发任务打满同一个账号；单会话仍按时间窗轮换，不会永久钉死。不写 `account` 时默认按模型 id 分桶，也能实现「并发任务用不同模型」。同一账号的多个模型可共用一个 `account` 名，让代理把它们视为同一资源、避免并发挤在一起。
+### 并发分片（按账号）
+
+同一时刻有多个任务在跑时，如果全都压在同一个上游账号上，限流会立刻打满。给池成员标上 `account` 后，代理会**按在途请求数分流**：
+
+- 每个账号的在途请求数越少越优先，同负载时取离当前时间窗模型最近的；
+- 顺序请求（同一会话、无并发）保持粘性，上下文不跳变；
+- 并发请求会被摊到不同账号，最多摊到「账号数」路并行。
+
+```jsonc
+// 同一上游账号下的多个模型共用一个 account 名，代理视为同一资源，不会互相挤占
+"pool": ["wb-deepseek@wb", "wb-glm@wb", "hy3@wb-multi"]
+```
+
+> 为什么要按「在途数」而不是按「会话」分片：多数客户端（含 WorkBuddy）不发 `X-Rotate-Session`，所有请求都落在同一个默认会话上，按会话分片等于没分片。按在途数分流才能保证并发任务真的落到不同账号。
+> 不写 `account` 时默认按模型 id 分桶（一个模型算一个账号），同样能把并发摊开。
 
 ## 控制脚本（Windows）
 
@@ -134,7 +153,7 @@ powershell -ExecutionPolicy Bypass -File rotator-ctl.ps1 testautostart # 停→�
 | 端点 | 说明 |
 |------|------|
 | `GET /health` 或 `/healthz` | `{ok, active_model, uptime_seconds}` |
-| `GET /status` 或 `/v1/rotator/status` | 完整快照：各模型冷却剩余、成功/失败计数、距下次轮换秒数、会话粘性数 |
+| `GET /status` 或 `/v1/rotator/status` | 完整快照：各模型所属账号与在途数、冷却剩余、成功/失败计数、距下次轮换秒数、`inflight_total` 与 `accounts` |
 | `GET /v1/models` | 只暴露一个 `expose_as` 模型，供客户端发现 |
 
 ## 探测模型真实能力
@@ -169,6 +188,12 @@ python probe_models.py --agent2api http://127.0.0.1:9000/v1 --models-json /path/
 7. **透传时丢弃上游的 `Content-Length` / `Transfer-Encoding`**：由本层按实际转发方式重算，否则响应头冲突导致客户端解析异常。
 8. **验证本机服务要绕过沙箱/公司代理**：Bash 里的 `curl` 可能被沙箱代理劫持返回假 502，误判成故障。验证用 PowerShell `Invoke-WebRequest -Proxy $null` 或 Python 的 `ProxyHandler({})` 直连。
 9. **怀疑进程被回收时查端口监听**：用 `Get-NetTCPConnection -LocalPort 3166`（PowerShell）确认是否还在监听，不要只看 `curl`/`Invoke-WebRequest` 的结果。
+10. **`restart` 抢跑会留出空窗**：计划任务设了 `MultipleInstances=IgnoreNew`，若旧实例还没退干净就 `Start-ScheduledTask`，新实例会被直接忽略，表现为「restart 之后端口没了」。`rotator-ctl.ps1 restart` 已改成停稳后再起并轮询健康检查；手写脚本时同样要等 `Stop-Process` 生效。
+11. **`pythonw.exe` 崩溃不留任何痕迹**：`rotator.log` 里没有 traceback、进程凭空消失、事件日志也没有记录时，先看同目录 `crash.log`。代理已挂 `faulthandler` + 线程/主线程异常钩子，原生崩溃和未捕获异常都会写在这里。
+12. **本机并发验证别用 Bash 工具**：Bash 沙箱可能连不上 `127.0.0.1` 上的本机端口（直接 `WinError 10061`），但这不代表服务挂了。用 PowerShell 或它的子进程验证：
+    ```powershell
+    python tests\live_concurrency_check.py     # 并发 3 个请求，断言落到 3 个不同账号
+    ```
 
 ## 许可证
 

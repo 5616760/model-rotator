@@ -26,6 +26,7 @@ WorkBuddy 模型自动轮换代理 (Model Rotator Proxy)
 """
 
 import base64
+import faulthandler
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ import ssl
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from collections import OrderedDict
@@ -83,6 +85,11 @@ def build_config():
     by_id = {m["id"]: m for m in models}
     pool = []
     for entry in cfg["pool"]:
+        # 轻量写法 "model-id@account"：给池成员标上游账号，并发时按账号分片。
+        # 不写 @ 时账号默认等于模型 id（每个模型自成一组）。
+        acc = None
+        if isinstance(entry, str) and "@" in entry:
+            entry, acc = entry.rsplit("@", 1)
         # 内联成员: {"id":..., "url":..., "key_from":"<models.json 中的 id>"}
         # key_from 让密钥继续只存在 models.json，不复制到 config.json。
         if isinstance(entry, dict) and "url" in entry:
@@ -97,7 +104,7 @@ def build_config():
                 "url": entry["url"].rstrip("/") + "/chat/completions"
                       if "/chat/completions" not in entry["url"] else entry["url"],
                 "key": entry.get("key", "") or src_key,
-                "account": entry.get("account") or entry["id"],
+                "account": entry.get("account") or acc or entry["id"],
                 "meta": entry.get("meta", {}),
             })
             continue
@@ -108,7 +115,7 @@ def build_config():
             "id": entry,
             "url": m["url"].rstrip("/") + "/chat/completions",
             "key": m.get("apiKey") or "",
-            "account": entry,
+            "account": acc or entry,
             "meta": {
                 "vendor": m.get("vendor"),
                 "supportsToolCall": m.get("supportsToolCall"),
@@ -144,6 +151,7 @@ class State:
         self.win_start = time.time()
         self.cooldown = {}          # idx -> until_ts
         self.sessions = OrderedDict()  # sid -> (idx, win_idx)
+        self.inflight = {}           # idx -> 正在处理中的请求数
         self.stats = {}              # idx -> {ok, fail, fail_types:{}}
         for i in range(self.n):
             self.stats[i] = {"ok": 0, "fail": 0, "fail_types": {}}
@@ -180,41 +188,60 @@ class State:
     def _account_of(self, idx):
         return self.pool[idx].get("account") or self.pool[idx]["id"]
 
-    def _used_accounts(self, exclude_sid):
-        """当前其它粘性会话占用的账号计数（sid 集合为 self.sessions: sid->(idx,win)）。"""
-        used = {}
-        for s, (i, _w) in self.sessions.items():
-            if s == exclude_sid:
-                continue
-            a = self._account_of(i)
-            used[a] = used.get(a, 0) + 1
-        return used
+    def _account_load_locked(self):
+        """账号 -> 在途请求数。并发任务是靠这个分散到不同账号的。"""
+        load = {}
+        for i, c in self.inflight.items():
+            if c:
+                a = self._account_of(i)
+                load[a] = load.get(a, 0) + c
+        return load
 
-    def _pick_account_locked(self, exclude_sid, start):
-        """选一个「账号」尽量不与其它会话冲突的模型；空闲时即 start（cur）。
-        用于并发任务按账号分片：同时跑的任务落到不同账号，避免单账号被并发打满。"""
-        used = self._used_accounts(exclude_sid)
-        best = None
-        best_score = None
+    def _pick_by_load_locked(self, start):
+        """优先选在途请求最少的账号，同负载时取离 start 最近的模型。
+
+        为什么不能只按会话分片：客户端通常不带 X-Rotate-Session，所有请求都落
+        在同一个默认会话上，按会话分片等于没分片。按在途数分流才能保证同一时刻
+        并发跑的任务落到不同账号。
+        """
+        load = self._account_load_locked()
+        best, best_score = None, None
         for off in range(self.n):
             i = (start + off) % self.n
             if not self._avail_locked(i):
                 continue
-            a = self._account_of(i)
-            score = (used.get(a, 0), off)   # 优先没被占用的账号，其次离 cur 最近
+            score = (load.get(self._account_of(i), 0), off)
             if best_score is None or score < best_score:
-                best_score = score
-                best = i
-                if used.get(a, 0) == 0 and off == 0:
-                    return i
+                best, best_score = i, score
         return best
+
+    def _acquire_locked(self, idx):
+        self.inflight[idx] = self.inflight.get(idx, 0) + 1
+
+    def acquire(self, idx):
+        with self.lock:
+            self._acquire_locked(idx)
+
+    def release(self, idx):
+        """请求结束（成功/失败/中断）必须调用，否则在途计数只增不减。"""
+        with self.lock:
+            c = self.inflight.get(idx, 0) - 1
+            if c > 0:
+                self.inflight[idx] = c
+            else:
+                self.inflight.pop(idx, None)
+
+    def inflight_count(self):
+        with self.lock:
+            return sum(self.inflight.values())
 
     def current(self):
         with self.lock:
             return self.pool[self._window_locked()]["id"]
 
-    # ---- 决定本次请求路由到下标 ----
+    # ---- 决定本次请求路由到下标（原子地登记在途） ----
     def resolve(self, sid):
+        """选模型并原子地把它记为在途；调用方结束时必须 release(idx)。"""
         with self.lock:
             self._window_locked()
             win_idx = self.win_idx
@@ -224,18 +251,26 @@ class State:
                 # 粘性只在「同一时间窗」内生效：跨窗则释放，跟随轮换到当前窗模型；
                 # 绑定模型若在冷却也释放，从当前窗重新选。避免长会话被永久钉死。
                 if bound_win == win_idx and self._avail_locked(bound_idx):
-                    self.sessions[sid] = (bound_idx, bound_win)
-                    self.sessions.move_to_end(sid)
-                    return bound_idx, False
+                    if self._account_load_locked().get(self._account_of(bound_idx), 0) == 0:
+                        self.sessions.move_to_end(sid)
+                        self._acquire_locked(bound_idx)
+                        return bound_idx, False
+                    # 该账号已有请求在跑：本次让给别的账号，但不重绑会话，
+                    # 顺序请求结束后仍会回到原模型，只有并发请求被摊开。
+                    idx = self._pick_by_load_locked(self.cur)
+                    if idx is None:
+                        idx = bound_idx
+                    self._acquire_locked(idx)
+                    return idx, False
             target = self.cur
             if entry is None and not self.rotate_on_first:
                 target = 0
-            idx = self._pick_account_locked(sid, target)
+            idx = self._pick_by_load_locked(target)
             cleared = False
             if idx is None:        # 池内全冷却 -> 清冷却重试一轮
                 log.warning("池内全部处于冷却，清除冷却后重试一轮")
                 self.cooldown.clear()
-                idx = self._pick_account_locked(sid, target)
+                idx = self._pick_by_load_locked(target)
                 cleared = True
             if idx is None:
                 idx = self.cur
@@ -243,6 +278,7 @@ class State:
                 self.sessions[sid] = (idx, win_idx)
                 while len(self.sessions) > 4096:
                     self.sessions.popitem(last=False)
+            self._acquire_locked(idx)
             return idx, cleared
 
     # ---- 失败：置冷却并给出下一候选 ----
@@ -287,7 +323,9 @@ class State:
                 cd = self.cooldown.get(i, 0)
                 out.append({
                     "id": m["id"],
+                    "account": self._account_of(i),
                     "active": i == self.cur,
+                    "inflight": self.inflight.get(i, 0),
                     "cooldown_remaining": max(0, round(cd - now)) if cd else 0,
                     "ok": self.stats[i]["ok"],
                     "fail": self.stats[i]["fail"],
@@ -298,6 +336,8 @@ class State:
                 "active": self.pool[self.cur]["id"],
                 "index": self.cur,
                 "pool_size": self.n,
+                "accounts": sorted({self._account_of(i) for i in range(self.n)}),
+                "inflight_total": sum(self.inflight.values()),
                 "rotate_minutes": round(self.rotate_s / 60),
                 "cooldown_minutes": round(self.cooldown_s / 60),
                 "seconds_to_next_rotate": max(0, round(nxt)),
@@ -456,68 +496,76 @@ class Handler(BaseHTTPRequestHandler):
         stream = bool(parsed.get("stream"))
 
         # 路由：先取候选顺序（首个 + 失败转移链）
-        idx, cleared = ST.resolve(sid)
+        idx, cleared = ST.resolve(sid)      # resolve 已原子地把 idx 记为在途
         tried = []
         attempt_chain = [idx]
+        held = idx                          # 当前占用在途名额的池下标
 
-        last_err = None
-        for probe_i in range(len(ST.pool) + 2):
-            if not attempt_chain:
-                break
-            cur_idx = attempt_chain.pop(0)
-            member = ST.pool[cur_idx]
-            parsed["model"] = member["id"]
-            body_bytes = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
+        try:
+            for probe_i in range(len(ST.pool) + 2):
+                if not attempt_chain:
+                    break
+                cur_idx = attempt_chain.pop(0)
+                if cur_idx != held:         # 失败转移：名额从旧模型迁到新模型
+                    ST.release(held)
+                    ST.acquire(cur_idx)
+                    held = cur_idx
+                member = ST.pool[cur_idx]
+                parsed["model"] = member["id"]
+                body_bytes = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
 
-            extra = {k: v for k, v in self.headers.items()}
-            req = build_upstream_request(
-                member["url"], body_bytes, member["key"], extra)
+                extra = {k: v for k, v in self.headers.items()}
+                req = build_upstream_request(
+                    member["url"], body_bytes, member["key"], extra)
 
-            t0 = time.time()
-            try:
-                resp = urlopen_direct(req, timeout=600)
-            except urllib.error.HTTPError as e:
-                tried.append((member["id"], "http_%s" % e.code))
-                log.warning("upstream %s HTTP %s (%.1fs): %s",
-                            member["id"], e.code, time.time() - t0,
-                            scrub(e.read(400).decode("utf-8", "replace"))[:400])
-                if e.code in CFG["fail_status"]:
-                    nxt = ST.mark_fail(cur_idx, "http_%s" % e.code)
-                    attempt_chain = nxt
-                    continue
-                # 不可恢复错误：404 model_not_found 等，移出池
-                if e.code == 404:
-                    ST.evict(cur_idx)
-                self._relay_error(e)
+                t0 = time.time()
+                try:
+                    resp = urlopen_direct(req, timeout=600)
+                except urllib.error.HTTPError as e:
+                    tried.append((member["id"], "http_%s" % e.code))
+                    log.warning("upstream %s HTTP %s (%.1fs): %s",
+                                member["id"], e.code, time.time() - t0,
+                                scrub(e.read(400).decode("utf-8", "replace"))[:400])
+                    if e.code in CFG["fail_status"]:
+                        attempt_chain = ST.mark_fail(cur_idx, "http_%s" % e.code)
+                        continue
+                    # 不可恢复错误：404 model_not_found 等，移出池
+                    if e.code == 404:
+                        ST.evict(cur_idx)
+                    self._relay_error(e)
+                    return
+                except (urllib.error.URLError, TimeoutError, ssl.SSLError) as e:
+                    tried.append((member["id"], "exception"))
+                    reason = getattr(e, "reason", e)
+                    log.warning("upstream %s 连接异常 (%.1fs): %s",
+                                member["id"], time.time() - t0, scrub(str(reason))[:300])
+                    if CFG["fail_on_exception"]:
+                        attempt_chain = ST.mark_fail(cur_idx, "exception")
+                        continue
+                    self._json(502, {"error": {"message": "upstream connect error: %s" % reason,
+                                               "type": "upstream_error"}})
+                    return
+
+                # 成功：透传
+                ST.mark_ok(cur_idx)
+                self._relay(resp, stream)
+                log.info("routed sid=%s model=%s acct=%s inflight=%s stream=%s tools=%s attempts=%s %s",
+                         (sid or "")[:18], member["id"],
+                         ST.pool[cur_idx].get("account") or "-",
+                         ST.inflight_count(), stream,
+                         bool(parsed.get("tools")), len(tried) + 1,
+                         "OK %.1fs" % (time.time() - t0))
                 return
-            except (urllib.error.URLError, TimeoutError, ssl.SSLError) as e:
-                tried.append((member["id"], "exception"))
-                reason = getattr(e, "reason", e)
-                log.warning("upstream %s 连接异常 (%.1fs): %s",
-                            member["id"], time.time() - t0, scrub(str(reason))[:300])
-                if CFG["fail_on_exception"]:
-                    nxt = ST.mark_fail(cur_idx, "exception")
-                    attempt_chain = nxt
-                    continue
-                self._json(502, {"error": {"message": "upstream connect error: %s" % reason,
-                                           "type": "upstream_error"}})
-                return
 
-            # 成功：透传
-            ST.mark_ok(cur_idx)
-            self._relay(resp, stream)
-            log.info("routed sid=%s model=%s stream=%s tools=%s attempts=%s %s",
-                     (sid or "")[:18], member["id"], stream,
-                     bool(parsed.get("tools")), len(tried) + 1,
-                     "OK %.1fs" % (time.time() - t0))
-            return
-
-        # 全部候选失败
-        self._json(429, {"error": {
-            "message": "所有池模型均失败或冷却中，已尝试: %s" %
-                       ", ".join("%s(%s)" % t for t in tried),
-            "type": "rate_limit_error",
-            "code": "all_models_unavailable"}})
+            # 全部候选失败
+            self._json(429, {"error": {
+                "message": "所有池模型均失败或冷却中，已尝试: %s" %
+                           ", ".join("%s(%s)" % t for t in tried),
+                "type": "rate_limit_error",
+                "code": "all_models_unavailable"}})
+        finally:
+            if held is not None:
+                ST.release(held)
 
     # ---- 透传上游响应（流式逐块，非流式读满） ----
     def _relay(self, resp, stream):
@@ -593,8 +641,38 @@ def probe_health(host, port, timeout=2):
         return False
 
 
+def setup_crash_log():
+    """把崩溃证据落到 crash.log。
+
+    计划任务用 pythonw.exe 启动，没有 stderr——进程一旦原生崩溃或主线程异常退出，
+    rotator.log 里不会留任何痕迹（这一现象在真实使用中复现过两次）。这里挂
+    faulthandler + 线程/主线程异常钩子，让下一次崩溃有据可查。
+    """
+    try:
+        f = open(os.path.join(HERE, "crash.log"), "a", encoding="utf-8", buffering=1)
+    except OSError:
+        return
+    faulthandler.enable(file=f, all_threads=True)
+
+    def _thread_hook(args):
+        f.write("\n[%s] 线程未捕获异常 thread=%s\n"
+                % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                   getattr(args.thread, "name", "?")))
+        traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback, file=f)
+        f.flush()
+
+    def _main_hook(exc_type, exc, tb):
+        f.write("\n[%s] 主线程未捕获异常\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        traceback.print_exception(exc_type, exc, tb, file=f)
+        f.flush()
+
+    threading.excepthook = _thread_hook
+    sys.excepthook = _main_hook
+
+
 def main():
     global CFG, ST
+    setup_crash_log()
     cfg = build_config()
     CFG = cfg
     setup_log(cfg.get("log_file") or os.path.join(HERE, "rotator.log"))
@@ -627,8 +705,12 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         log.info("收到中断信号，退出")
+    except BaseException:
+        log.exception("主循环异常退出")
+        raise
     finally:
         srv.server_close()
+        log.warning("主循环结束，进程即将退出（若不是主动停止，请查 crash.log）")
 
 
 if __name__ == "__main__":

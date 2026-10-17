@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-账号感知路由回归测试：
-- 并发的不同会话应尽量落到不同账号（不同任务用不同账号的模型）。
+账号分片路由回归测试（按「在途请求数」分片）：
+- 同一时刻的多个并发请求应落到不同账号（关键：客户端通常都发同一个默认会话，
+  所以不能按会话分片，必须按在途数）。
+- 顺序请求（无并发）保持粘性，不会被摊开。
 - 单会话仍跟随时间窗轮换（不会永久钉死）。
-- 账号标签缺失时回退为「按模型 id 分桶」，仍能分片。
+- 未标 account 时回退为「一个模型一个账号」，仍能分片。
+- 请求结束 release 后名额归零，不泄漏。
 """
 import os
 import sys
@@ -19,52 +22,89 @@ def make_pool(n, accounts):
     return [{"id": "m%d" % i, "account": accounts[i % len(accounts)]} for i in range(n)]
 
 
-def test_concurrent_sessions_get_distinct_accounts():
-    # 3 个账号、9 个模型（每账号 3 模型），同一时刻 3 个并发会话应各占不同账号
+def test_default_session_concurrency_spreads():
+    """客户端全用同一个 sid 时也必须摊开——这是修复前失效的场景。"""
     pool = make_pool(9, ["A", "B", "C"])
-    st = State(pool, rotate_s=10, cooldown_s=0, rotate_on_first=True)
-    got = {st.resolve("s%d" % k)[0] for k in range(3)}
-    accts = {pool[i]["account"] for i in got}
-    assert len(got) == 3, got                       # 三个会话路由到三个不同模型
-    assert len(accts) == 3, accts                   # 且分属三个不同账号
-    print("OK concurrent: distinct accounts ->", accts)
+    st = State(pool, rotate_s=600, cooldown_s=0, rotate_on_first=True)
+    idxs = [st.resolve("default")[0] for _ in range(3)]   # 3 个并发，sid 全相同
+    accts = [pool[i]["account"] for i in idxs]
+    assert len(set(accts)) == 3, accts
+    assert len(set(idxs)) == 3, idxs
+    print("OK same-sid concurrency spreads ->", accts)
+
+
+def test_sequential_requests_stay_sticky():
+    """没有并发时，同一个会话应一直用同一个模型（上下文不跳变）。"""
+    pool = make_pool(9, ["A", "B", "C"])
+    st = State(pool, rotate_s=600, cooldown_s=0, rotate_on_first=True)
+    i0 = st.resolve("default")[0]
+    st.release(i0)                                        # 请求结束
+    for _ in range(3):
+        i = st.resolve("default")[0]
+        assert i == i0, (i, i0)
+        st.release(i)
+    print("OK sequential sticky ->", i0)
+
+
+def test_concurrent_overflow_uses_least_loaded():
+    # 账号数(2) < 并发数(4)：两账号各 2 个在途，不允许 3:1 的倾斜
+    pool = make_pool(6, ["A", "B"])
+    st = State(pool, rotate_s=600, cooldown_s=0, rotate_on_first=True)
+    accts = [pool[st.resolve("default")[0]]["account"] for _ in range(4)]
+    assert accts.count("A") == 2 and accts.count("B") == 2, accts
+    print("OK overflow least-loaded ->", accts)
 
 
 def test_lone_session_follows_window():
-    pool = [{"id": "m%d" % i, "account": "A%d" % i} for i in range(4)]
+    pool = [{"id": "m%d" % i, "account": "A%d" % i} for i in range(8)]
     st = State(pool, rotate_s=1, cooldown_s=0, rotate_on_first=True)
-    i0, _ = st.resolve("a")
-    time.sleep(1.1)
-    i1, _ = st.resolve("a")
-    time.sleep(1.1)
-    i2, _ = st.resolve("a")
-    assert (i0, i1, i2) == (0, 1, 2), (i0, i1, i2)
-    print("OK lone session follows window:", (i0, i1, i2))
+    got = []
+    for _ in range(3):
+        i = st.resolve("a")[0]
+        got.append(i)
+        st.release(i)
+        time.sleep(1.1)
+    assert got == [0, 1, 2], got
+    print("OK lone session follows window:", got)
 
 
 def test_fallback_to_model_id_when_no_account():
-    # 故意不给 account（build_config 里会回退为模型 id），并发仍应分片到不同模型
+    # 不给 account：一个模型自成一组，并发仍应分片到不同模型
     pool = [{"id": "m%d" % i} for i in range(6)]
-    st = State(pool, rotate_s=10, cooldown_s=0, rotate_on_first=True)
-    got = {st.resolve("s%d" % k)[0] for k in range(4)}
-    assert len(got) == 4, got
+    st = State(pool, rotate_s=600, cooldown_s=0, rotate_on_first=True)
+    got = [st.resolve("default")[0] for _ in range(4)]
+    assert len(set(got)) == 4, got
     print("OK fallback(model-id) sharding ->", got)
 
 
-def test_overflow_least_used():
-    # 账号数(2)少于并发会话数(3)：最多一个账号被复用，且是占用最少者
-    pool = make_pool(6, ["A", "B"])
-    st = State(pool, rotate_s=10, cooldown_s=0, rotate_on_first=True)
-    idxs = [st.resolve("s%d" % k)[0] for k in range(3)]
-    accts = [pool[i]["account"] for i in idxs]
-    assert accts.count("A") <= 2 and accts.count("B") <= 2, accts
-    assert set(accts) <= {"A", "B"}
-    print("OK overflow least-used ->", accts)
+def test_release_does_not_leak():
+    pool = make_pool(4, ["A", "B"])
+    st = State(pool, rotate_s=600, cooldown_s=0, rotate_on_first=True)
+    for _ in range(50):
+        i = st.resolve("default")[0]
+        st.release(i)
+    assert st.inflight_count() == 0, st.inflight_count()
+    assert st.inflight == {}, st.inflight
+    print("OK release no leak -> inflight=0")
+
+
+def test_cooldown_member_skipped():
+    pool = make_pool(3, ["A", "B", "C"])
+    st = State(pool, rotate_s=600, cooldown_s=60, rotate_on_first=True)
+    i0 = st.resolve("default")[0]
+    st.mark_fail(i0, "http_429")
+    st.release(i0)
+    i1 = st.resolve("default")[0]
+    assert i1 != i0, (i0, i1)
+    print("OK cooldown skipped ->", i0, "->", i1)
 
 
 if __name__ == "__main__":
-    test_concurrent_sessions_get_distinct_accounts()
+    test_default_session_concurrency_spreads()
+    test_sequential_requests_stay_sticky()
+    test_concurrent_overflow_uses_least_loaded()
     test_lone_session_follows_window()
     test_fallback_to_model_id_when_no_account()
-    test_overflow_least_used()
-    print("\nALL ACCOUNT-AFFINITY TESTS PASSED")
+    test_release_does_not_leak()
+    test_cooldown_member_skipped()
+    print("\nALL ACCOUNT-SHARDING TESTS PASSED")
