@@ -51,6 +51,9 @@ MAX_REQ_BYTES = 64 * 1024 * 1024  # 请求体上限，超出直接拒（防内�
 # 两者请求体都用 model 字段、都支持 stream，故共用同一套路由与失败转移。
 SUPPORTED_POST_PATHS = ("/v1/chat/completions", "/v1/responses")
 
+UPSTREAM_TIMEOUT = 600          # 单次上游请求的 socket 超时（秒）
+HEDGE_POLL = 0.02               # 看门狗轮询间隔（秒），只影响判定粒度，不影响延迟
+
 log = logging.getLogger("rotator")
 START_TS = time.time()
 HOP_BY_HOP = {"content-length", "transfer-encoding", "connection", "keep-alive",
@@ -266,6 +269,28 @@ class State:
             i = max(avail, key=lambda k: (self.pool[k].get("quality", 50), -k))
             return self.pool[i]["id"]
 
+    def pick_alternate(self, exclude):
+        """看门狗对冲用：在 exclude 之外挑一路，优先「别的账号 + 质量高」。
+
+        为什么强调换账号：对冲的目的是绕开某一个账号被限流/卡住，如果第二路
+        落在同一账号上，大概率一起卡。当前请求已占用的账号在途数 > 0，所以按
+        在途数升序排序天然会把其它账号排在前面。
+        """
+        with self.lock:
+            load = self._account_load_locked()
+            quality_first = bool(CFG and CFG.get("quality_priority", True))
+            best, best_score = None, None
+            for i in range(self.n):
+                if i in exclude or not self._avail_locked(i):
+                    continue
+                acct_load = load.get(self._account_of(i), 0)
+                q = self.pool[i].get("quality", 50)
+                score = ((acct_load, -q if quality_first else 0, i) if quality_first
+                         else (acct_load, i))
+                if best_score is None or score < best_score:
+                    best, best_score = i, score
+            return best
+
     # ---- 决定本次请求路由到下标（原子地登记在途） ----
     def resolve(self, sid):
         """选模型并原子地把它记为在途；调用方结束时必须 release(idx)。"""
@@ -456,6 +481,67 @@ def urlopen_direct(req, timeout):
     return _OPENER.open(req, timeout=timeout)
 
 
+# ------------------------------------------------------------------- watchdog  #
+class Attempt:
+    """一次上游尝试，跑在独立线程里，外部可以「只等 N 秒就先走」。
+
+    为什么需要它：urllib 的 timeout 是 socket 级超时（无数据多久断），无法表达
+    「3 秒内没等到响应头就放弃」。而黑名单式的卡死（上游算完超长上下文才报错、
+    网关 504 前先沉默 20-30s）恰恰是「连接正常但没有响应」，socket 超时抓不到。
+
+    线程里 open() 是阻塞的，主线程只等 Event，所以等待超时不会泄漏线程 ——
+    后台线程最终仍会自己结束（超时/报错/读到数据），只是结果被丢弃。
+    """
+
+    __slots__ = ("member", "req", "box", "done")
+
+    def __init__(self, member, req):
+        self.member = member
+        self.req = req
+        self.box = {}          # {"resp": response} 或 {"error": exc}
+        self.done = threading.Event()
+
+    def start(self):
+        t = threading.Thread(target=self._run, name="up-%s" % self.member["id"],
+                             daemon=True)
+        t.start()
+        return self
+
+    def _run(self):
+        try:
+            resp = _OPENER.open(self.req, timeout=UPSTREAM_TIMEOUT)
+            self.box["resp"] = resp
+        except BaseException as e:      # noqa: BLE001 - 任何异常都要让主线程知道
+            self.box["error"] = e
+        finally:
+            self.done.set()
+
+    # -- 主线程侧 --
+    def wait_headers(self, seconds):
+        """最多等 seconds 秒拿响应头；返回 True 表示已有结果（成功或报错）。"""
+        return self.done.wait(seconds)
+
+    def value(self):
+        """取结果：成功返回 response，失败抛原异常。"""
+        self.done.wait()
+        err = self.box.get("error")
+        if err is not None:
+            raise err
+        return self.box["resp"]
+
+    def abandon(self):
+        """不再使用这一路。后台线程自己收尾，这里只关掉可能已建立的连接。"""
+        def _close():
+            self.done.wait(UPSTREAM_TIMEOUT)
+            resp = self.box.get("resp")
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+        threading.Thread(target=_close, daemon=True).start()
+
+
 # --------------------------------------------------------------------------- handler #
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -546,6 +632,58 @@ class Handler(BaseHTTPRequestHandler):
         tried = []
         attempt_chain = [idx]
         held = idx                          # 当前占用在途名额的池下标
+        _hedge_extra = set()                # 对冲额外名额，供 finally 兜底释放
+        hedge_after = float(CFG.get("hedge_after_seconds") or 0)
+        hedge_max = int(CFG.get("hedge_max") or 0)
+
+        def make_attempt(i):
+            """按池下标构造一次上游尝试（body 里的 model 已改写）。"""
+            m = ST.pool[i]
+            body = dict(parsed)
+            body["model"] = m["id"]
+            bb = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            extra = {k: v for k, v in self.headers.items()}
+            req = build_upstream_request(
+                upstream_url(m["url"], path), bb, m["key"], extra)
+            return Attempt(m, req).start()
+
+        def classify(e, cur_idx, member, t0):
+            """把一次失败翻译成 (是否可继续, 下一批候选)。
+
+            返回 ("retry", chain) 表示可换路重试；("return", None) 表示已回包。
+            """
+            if isinstance(e, urllib.error.HTTPError):
+                tried.append((member["id"], "http_%s" % e.code))
+                log.warning("upstream %s HTTP %s (%.1fs): %s",
+                            member["id"], e.code, time.time() - t0,
+                            scrub(e.read(400).decode("utf-8", "replace"))[:400])
+                if e.code in CFG["fail_status"]:
+                    return "retry", ST.mark_fail(cur_idx, "http_%s" % e.code)
+                if e.code == 404:
+                    ST.evict(cur_idx)
+                self._relay_error(e)
+                return "return", None
+            tried.append((member["id"], "exception"))
+            reason = getattr(e, "reason", e)
+            log.warning("upstream %s 连接异常 (%.1fs): %s",
+                        member["id"], time.time() - t0, scrub(str(reason))[:300])
+            if CFG["fail_on_exception"]:
+                return "retry", ST.mark_fail(cur_idx, "exception")
+            self._json(502, {"error": {"message": "upstream connect error: %s" % reason,
+                                       "type": "upstream_error"}})
+            return "return", None
+
+        def succeed(cur_idx, resp, t0, tag):
+            ST.mark_ok(cur_idx)
+            self._relay(resp, stream)
+            log.info("routed sid=%s model=%s acct=%s inflight=%s stream=%s tools=%s "
+                     "attempts=%s ep=%s %s",
+                     (sid or "")[:18], ST.pool[cur_idx]["id"],
+                     ST.pool[cur_idx].get("account") or "-",
+                     ST.inflight_count(), stream,
+                     bool(parsed.get("tools")), len(tried) + 1,
+                     path.rsplit("/", 1)[-1],
+                     "%s %.1fs" % (tag, time.time() - t0))
 
         try:
             for probe_i in range(len(ST.pool) + 2):
@@ -557,52 +695,119 @@ class Handler(BaseHTTPRequestHandler):
                     ST.acquire(cur_idx)
                     held = cur_idx
                 member = ST.pool[cur_idx]
-                parsed["model"] = member["id"]
-                body_bytes = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
-
-                extra = {k: v for k, v in self.headers.items()}
-                req = build_upstream_request(
-                    upstream_url(member["url"], path), body_bytes, member["key"], extra)
-
                 t0 = time.time()
-                try:
-                    resp = urlopen_direct(req, timeout=600)
-                except urllib.error.HTTPError as e:
-                    tried.append((member["id"], "http_%s" % e.code))
-                    log.warning("upstream %s HTTP %s (%.1fs): %s",
-                                member["id"], e.code, time.time() - t0,
-                                scrub(e.read(400).decode("utf-8", "replace"))[:400])
-                    if e.code in CFG["fail_status"]:
-                        attempt_chain = ST.mark_fail(cur_idx, "http_%s" % e.code)
+                first = make_attempt(cur_idx)
+
+                # ---- 看门狗：先只等 hedge_after 秒的响应头 ----
+                # hedge_max < 2 等于没有备胎可补，必须当作关闭处理；否则
+                # 进对冲分支后 len(racers) < hedge_max 恒假，内层会空转挂死。
+                if hedge_after > 0 and hedge_max >= 2:
+                    ready = first.wait_headers(hedge_after)
+                else:
+                    # 看门狗关闭：老行为，一直等到有响应头（或报错）为止
+                    first.done.wait()
+                    ready = True
+
+                if ready:
+                    # 正常路径：立刻拿到响应头（实测 p90 < 1.3s，绝大多数请求走这里）
+                    try:
+                        resp = first.value()
+                    except (urllib.error.HTTPError, urllib.error.URLError,
+                            TimeoutError, ssl.SSLError) as e:
+                        kind, chain = classify(e, cur_idx, member, t0)
+                        if kind == "return":
+                            return
+                        attempt_chain = chain
                         continue
-                    # 不可恢复错误：404 model_not_found 等，移出池
-                    if e.code == 404:
-                        ST.evict(cur_idx)
-                    self._relay_error(e)
-                    return
-                except (urllib.error.URLError, TimeoutError, ssl.SSLError) as e:
-                    tried.append((member["id"], "exception"))
-                    reason = getattr(e, "reason", e)
-                    log.warning("upstream %s 连接异常 (%.1fs): %s",
-                                member["id"], time.time() - t0, scrub(str(reason))[:300])
-                    if CFG["fail_on_exception"]:
-                        attempt_chain = ST.mark_fail(cur_idx, "exception")
-                        continue
-                    self._json(502, {"error": {"message": "upstream connect error: %s" % reason,
-                                               "type": "upstream_error"}})
+                    succeed(cur_idx, resp, t0, "OK")
                     return
 
-                # 成功：透传
-                ST.mark_ok(cur_idx)
-                self._relay(resp, stream)
-                log.info("routed sid=%s model=%s acct=%s inflight=%s stream=%s tools=%s attempts=%s ep=%s %s",
-                         (sid or "")[:18], member["id"],
-                         ST.pool[cur_idx].get("account") or "-",
-                         ST.inflight_count(), stream,
-                         bool(parsed.get("tools")), len(tried) + 1,
-                         path.rsplit("/", 1)[-1],
-                         "OK %.1fs" % (time.time() - t0))
-                return
+                # ---- 慢：进入条件对冲 ----
+                # racers 里的每一路都在独立线程里等响应头；谁先拿到就用谁，
+                # 其余立刻放弃并归还账号名额 —— 一旦有人能出响应，再让其它路
+                # 继续跑只是白占并发、白烧额度。
+                #
+                # 不变量：held 是 finally 唯一负责释放的名额；extra 里是额外
+                # 登记的对冲路名额，必须且只能释放一次。搞错会让在途计数虚高，
+                # 进而污染账号分片判断。
+                racers = [(cur_idx, first)]
+                extra = _hedge_extra   # 与 finally 共享的兜底集合
+                used = {cur_idx}    # 已经用过的池下标，防止同一模型开两路
+                warned = False
+                last_chain = []
+
+                def drop(ci):
+                    """归还某一路的额外名额；held 由 finally 统一释放。"""
+                    if ci in extra:
+                        extra.discard(ci)
+                        ST.release(ci)
+
+                while True:
+                    # 补充选手：换账号优先，最多 hedge_max 路
+                    if len(racers) < hedge_max:
+                        alt = ST.pick_alternate(used)
+                        if alt is not None:
+                            ST.acquire(alt)
+                            extra.add(alt)
+                            used.add(alt)
+                            racers.append((alt, make_attempt(alt)))
+                            if not warned:
+                                log.info("看门狗: %s %.1fs 无响应头，并发第 %d 路 -> %s",
+                                         member["id"], hedge_after, len(racers),
+                                         ST.pool[alt]["id"])
+                                warned = True
+
+                    done_now = [r for r in racers if r[1].done.is_set()]
+                    if not done_now:
+                        # 没有可补的备胎（其余模型全在冷却）：退回「等首选」，
+                        # 否则这里会空转挂死。
+                        if len(racers) == 1 and ST.pick_alternate(used) is None:
+                            remaining = racers[0][1]
+                            remaining.done.wait()
+                            done_now = [racers[0]]
+                        else:
+                            time.sleep(HEDGE_POLL)
+                            continue
+
+                    win_idx, win_at = done_now[0]
+                    racers = [r for r in racers if r[1] is not win_at]
+
+                    try:
+                        resp = win_at.value()
+                    except (urllib.error.HTTPError, urllib.error.URLError,
+                            TimeoutError, ssl.SSLError) as e:
+                        drop(win_idx)
+                        kind, chain = classify(e, win_idx, ST.pool[win_idx], t0)
+                        last_chain = chain or []
+                        if kind == "return":
+                            for ci, at in racers:
+                                at.abandon()
+                                drop(ci)
+                            return
+                        # 这一路已冷却。还有人在跑就先等它们；否则看能否再补
+                        # 一路；都不行就交给外层失败转移。
+                        if not racers and len(used) >= hedge_max:
+                            attempt_chain = last_chain
+                            break
+                        if not racers and ST.pick_alternate(used) is None:
+                            attempt_chain = last_chain
+                            break
+                        continue
+
+                    # 赢家产生：其余各路全部放弃并归还名额
+                    for ci, at in racers:
+                        at.abandon()
+                        drop(ci)
+                        log.info("看门狗: 放弃落败路 %s", ST.pool[ci]["id"])
+                    # 名额迁移：赢家若属对冲路，已在 extra 里占一格，把它提升
+                    # 为 held 即可 —— 千万不能再 acquire 一次，否则重复计数。
+                    if win_idx != held:
+                        ST.release(held)
+                        extra.discard(win_idx)
+                        held = win_idx
+                    succeed(win_idx, resp, t0, "OK(hedged x%d)" % len(used))
+                    return
+                continue
 
             # 全部候选失败
             self._json(429, {"error": {
@@ -613,6 +818,10 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             if held is not None:
                 ST.release(held)
+            # 兜底：异常/提前返回时对冲路可能还占着名额
+            for ci in list(_hedge_extra):
+                ST.release(ci)
+            _hedge_extra.clear()
 
     # ---- 透传上游响应（流式逐块，非流式读满） ----
     def _relay(self, resp, stream):
