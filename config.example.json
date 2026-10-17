@@ -16,6 +16,12 @@
   "fail_on_exception": true,
   "rotate_on_first_request": true,
   "expose_as": "AutoRotate",
+  "quality_priority": true,
+  "quality_scores": {
+    "gpt-4o-mini": 70,
+    "claude-3-5-haiku-latest": 80,
+    "local-model": 40
+  },
   "pool": [
     {
       "id": "gpt-4o-mini",

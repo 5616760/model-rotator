@@ -13,6 +13,9 @@ rotator.log
 
 # ---- Probe output (machine-specific capability scan) --------------------------
 probe_result.json
+quality_result.json
+eval_run*.log
+crash.log
 
 # ---- Secrets / environment ---------------------------------------------------
 .env

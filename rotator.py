@@ -84,6 +84,9 @@ def build_config():
     models = load_raw(src)
     by_id = {m["id"]: m for m in models}
     pool = []
+    # 每个模型的显式质量分（0-100，越大越好）。未写的模型按 50 处理。
+    # 用 quality_priority=false 可整体退回「纯时间窗轮换」的旧行为。
+    scores = cfg.get("quality_scores") or {}
     for entry in cfg["pool"]:
         # 轻量写法 "model-id@account"：给池成员标上游账号，并发时按账号分片。
         # 不写 @ 时账号默认等于模型 id（每个模型自成一组）。
@@ -105,6 +108,7 @@ def build_config():
                       if "/chat/completions" not in entry["url"] else entry["url"],
                 "key": entry.get("key", "") or src_key,
                 "account": entry.get("account") or acc or entry["id"],
+                "quality": float(entry.get("quality", scores.get(entry["id"], 50))),
                 "meta": entry.get("meta", {}),
             })
             continue
@@ -116,6 +120,7 @@ def build_config():
             "url": m["url"].rstrip("/") + "/chat/completions",
             "key": m.get("apiKey") or "",
             "account": acc or entry,
+            "quality": float(scores.get(entry, 50)),
             "meta": {
                 "vendor": m.get("vendor"),
                 "supportsToolCall": m.get("supportsToolCall"),
@@ -198,19 +203,27 @@ class State:
         return load
 
     def _pick_by_load_locked(self, start):
-        """优先选在途请求最少的账号，同负载时取离 start 最近的模型。
+        """选一个池下标。双重优先：先保并发摊开，再在同等空闲里挑质量最高的。
+
+        排序键（越小越好）:
+          1) 账号在途数 —— 这是并发分片，必须最优先，否则多个任务全压一个账号；
+          2) -质量分    —— 同等空闲时优先用更好的模型；
+          3) 离 start 的距离 —— 时间窗轮换的体现，也是稳定 tie-break。
 
         为什么不能只按会话分片：客户端通常不带 X-Rotate-Session，所有请求都落
-        在同一个默认会话上，按会话分片等于没分片。按在途数分流才能保证同一时刻
-        并发跑的任务落到不同账号。
+        在同一个默认会话上，按会话分片等于没分片。
         """
         load = self._account_load_locked()
+        quality_first = bool(CFG and CFG.get("quality_priority", True))
         best, best_score = None, None
         for off in range(self.n):
             i = (start + off) % self.n
             if not self._avail_locked(i):
                 continue
-            score = (load.get(self._account_of(i), 0), off)
+            acct_load = load.get(self._account_of(i), 0)
+            q = self.pool[i].get("quality", 50)
+            score = ((acct_load, -q if quality_first else 0, off) if quality_first
+                     else (acct_load, off))
             if best_score is None or score < best_score:
                 best, best_score = i, score
         return best
@@ -238,6 +251,15 @@ class State:
     def current(self):
         with self.lock:
             return self.pool[self._window_locked()]["id"]
+
+    def best(self):
+        """质量最高且可用的模型（供 /status 与启动日志展示）。"""
+        with self.lock:
+            avail = [i for i in range(self.n) if self._avail_locked(i)]
+            if not avail:
+                return None
+            i = max(avail, key=lambda k: (self.pool[k].get("quality", 50), -k))
+            return self.pool[i]["id"]
 
     # ---- 决定本次请求路由到下标（原子地登记在途） ----
     def resolve(self, sid):
@@ -324,6 +346,7 @@ class State:
                 out.append({
                     "id": m["id"],
                     "account": self._account_of(i),
+                    "quality": m.get("quality", 50),
                     "active": i == self.cur,
                     "inflight": self.inflight.get(i, 0),
                     "cooldown_remaining": max(0, round(cd - now)) if cd else 0,
