@@ -13,7 +13,7 @@ function Resolve-Python {
     if ($env:PYTHONW) { return $env:PYTHONW }
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($t) {
-        $a = Get-ScheduledTaskAction -TaskName $TaskName -ErrorAction SilentlyContinue | Select-Object -First 1
+        $a = $t.Actions | Select-Object -First 1
         if ($a -and $a.Execute -and $a.Execute -match 'pythonw?\.exe') { return $a.Execute }
     }
     $cmd = Get-Command pythonw.exe -ErrorAction SilentlyContinue
@@ -59,11 +59,31 @@ function Do-Start {
 }
 
 function Do-Stop {
-    $conns = Get-NetTCPConnection -LocalPort 3166 -State Listen -ErrorAction SilentlyContinue
-    if (-not $conns) { Write-Host 'Not running'; return }
-    $conns | Select-Object -ExpandProperty OwningProcess -Unique |
-        ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
-    Write-Host 'Stopped'
+    # Must actually free the port: a silently-failed Stop-Process used to make
+    # `restart` look successful while the stale (old-config) instance kept serving.
+    $killed = @()
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $conns = Get-NetTCPConnection -LocalPort 3166 -State Listen -ErrorAction SilentlyContinue
+        if (-not $conns) { break }
+        $conns | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object {
+            $procId = $_
+            try {
+                Stop-Process -Id $procId -Force -ErrorAction Stop
+                $killed += $procId
+            } catch {
+                Write-Host "Stop-Process failed for PID ${procId}: $($_.Exception.Message)"
+                & taskkill /F /PID $procId 2>&1 | Out-Host   # escalate
+            }
+        }
+        Start-Sleep -Seconds 1
+    }
+    $left = Get-NetTCPConnection -LocalPort 3166 -State Listen -ErrorAction SilentlyContinue
+    if ($left) {
+        Write-Host "ERROR: port 3166 still held by PID(s) $($left.OwningProcess -join ',') - refusing to continue"
+        exit 1
+    }
+    if ($killed.Count -gt 0) { Write-Host "Stopped (killed PID $($killed -join ','))" }
+    else { Write-Host 'Not running' }
 }
 
 function Do-Install {

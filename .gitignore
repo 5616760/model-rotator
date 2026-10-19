@@ -13,9 +13,14 @@ rotator.log
 
 # ---- Probe output (machine-specific capability scan) --------------------------
 probe_result.json
+probe_result.burst.json
 quality_result.json
 eval_run*.log
 crash.log
+r8.json
+
+# ---- Deployed single-file exe (build artifact; releases live on GH Releases) --
+ModelRotator.exe
 
 # ---- Secrets / environment ---------------------------------------------------
 .env

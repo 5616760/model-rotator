@@ -17,6 +17,8 @@ import json
 import os
 import ssl
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -24,6 +26,25 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # 默认值面向本地 agent2api 网关（如 WorkBuddy 自带）；可通过参数覆盖。
 AGENT2API = "http://127.0.0.1:3065/v1"
 MODELS_JSON = os.path.expanduser("~/.workbuddy/models.json")
+
+# 全局节流闸：agent2api 对整把密钥限流（默认 120 req/min）。并发跑探针时
+# 如果不限速，绝大多数结果会是「429 requests per minute」——那不是模型不可用，
+# 是探针自己把额度打满了。--rpm 用来把请求压到限流线以下。
+_THROTTLE_LOCK = threading.Lock()
+_LAST_CALL = [0.0]
+_MIN_INTERVAL = [0.0]
+
+
+def _throttle():
+    if _MIN_INTERVAL[0] <= 0:
+        return
+    with _THROTTLE_LOCK:
+        now = time.time()
+        wait = _LAST_CALL[0] + _MIN_INTERVAL[0] - now
+        if wait > 0:
+            time.sleep(wait)
+            now = time.time()
+        _LAST_CALL[0] = now
 
 TOOLS = [{
     "type": "function",
@@ -67,7 +88,7 @@ def probe(mid, key, timeout, want_stream):
     )
     out = {"id": mid, "ok": False, "tool_calls": False, "http": None,
            "err": "", "latency": 0.0, "text": ""}
-    import time
+    _throttle()
     t0 = time.time()
     try:
         r = urllib.request.urlopen(req, timeout=timeout,
@@ -113,7 +134,19 @@ def main():
                     help="upstream gateway base, e.g. http://127.0.0.1:3065/v1")
     ap.add_argument("--models-json", default="",
                     help="path to a models.json that holds api keys (WorkBuddy style)")
+    ap.add_argument("--rpm", type=int, default=0,
+                    help="全局请求速率上限（req/min），0=不限。agent2api 默认对整把密钥限 120/min，"
+                         "大批量探测务必设成 90 左右，否则结果会全是假 429")
+    ap.add_argument("--out", default="",
+                    help="结果输出路径，默认 probe_result.json")
+    ap.add_argument("--merge", action="store_true",
+                    help="与已有结果文件合并（只覆盖本轮 id），用于分批补测")
+    ap.add_argument("--retry-tool", type=int, default=1,
+                    help="对「200 但未调工具」的模型补测轮数，默认 1；设 0 关闭")
     args = ap.parse_args()
+
+    if args.rpm > 0:
+        _MIN_INTERVAL[0] = 60.0 / args.rpm
 
     if args.agent2api:
         globals()["AGENT2API"] = args.agent2api.rstrip("/")
@@ -141,10 +174,41 @@ def main():
                 flag, res["id"], res["http"], res["latency"],
                 (res.get("err") or res.get("called_fn") or res.get("text") or "")[:60]))
 
+    # 工具调用是「要求它调」而不是「禁止它调」，模型偶尔会直接文字作答而不调工具。
+    # 单次判定会把这些模型误判成不可用，所以对「200 但没调工具」的补测几轮。
+    if args.retry_tool > 0:
+        unclear = [r for r in results if r["ok"] and not r["tool_calls"]]
+        if unclear:
+            print("\n补测 %d 个「200 但未调工具」的模型（最多 %d 轮）..."
+                  % (len(unclear), args.retry_tool))
+            idx = {r["id"]: i for i, r in enumerate(results)}
+            for rnd in range(args.retry_tool):
+                todo = [r for r in results if r["ok"] and not r["tool_calls"]]
+                if not todo:
+                    break
+                with cf.ThreadPoolExecutor(max_workers=max(1, min(args.workers, 4))) as ex:
+                    futs = {ex.submit(probe, r["id"], key, args.timeout, False): r["id"]
+                            for r in todo}
+                    for fut in cf.as_completed(futs):
+                        res = fut.result()
+                        if res["tool_calls"]:
+                            print("  轮%d 恢复 TOOL-OK  %s (%.1fs)"
+                                  % (rnd + 1, res["id"], res["latency"]))
+                            results[idx[res["id"]]] = res
+
     order = {m: i for i, m in enumerate(ids)}
     results.sort(key=lambda r: order[r["id"]])
-    with open(os.path.join(HERE, "probe_result.json"), "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+    out_path = args.out or os.path.join(HERE, "probe_result.json")
+    if args.merge and os.path.exists(out_path):
+        # 只覆盖本轮探测到的 id，保留上一轮其它模型的结果（分批补测用）
+        merged = {r["id"]: r for r in json.load(open(out_path, encoding="utf-8"))}
+        for r in results:
+            merged[r["id"]] = r
+        results_to_write = list(merged.values())
+    else:
+        results_to_write = results
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(results_to_write, f, ensure_ascii=False, indent=2)
 
     good = [r["id"] for r in results if r["tool_calls"]]
     chat = [r["id"] for r in results if r["ok"] and not r["tool_calls"]]

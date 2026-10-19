@@ -28,6 +28,7 @@ SUITES = [
     "test_quality_routing.py",
     "test_account_affinity.py",
     "test_endpoints.py",
+    "test_control_api.py",
 ]
 
 

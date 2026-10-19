@@ -26,6 +26,7 @@ ModelRotator 在它们之上再放一层：
 - **会话粘性（窗内）**：同一 `X-Rotate-Session` / `user` 在**一个时间窗内**恒定路由到同一模型，避免多轮对话上下文跨模型跳变；窗口到点后该会话自动跟随轮换（不会永久钉死在首个模型）。
 - **并发按账号分片**：同一时刻有多个任务在跑时，按各 `account` 的在途请求数分流，把并发摊到不同上游账号；顺序请求仍保持粘性。多个任务共用一个默认会话也照样分开。
 - **看门狗（可选）**：首选模型超过 `hedge_after_seconds` 仍没回响应头（上游沉默而非慢）时，并发第二路换账号抢答，取先到的；正常请求零额外开销。见下方专节。
+- **内置控制面**：手动切换模型 / 快速刷新 / 赋权重 / 池成员启停 / 清冷却，全部**免重启**生效，有 HTTP API、Web 控制台、命令行开关三个入口。见下方专节。
 - **单实例保护**：启动前先探测本机端口健康，已有实例在跑则主动退出，避免端口互抢。
 - **只读上游清单**：从 `source_models_json` 读取密钥，绝不回写。
 
@@ -97,6 +98,27 @@ python build_exe.py --console # 保留控制台窗口，方便看日志
 3. 编辑 `config.json`，把 `pool` 里的 `url`/`key` 换成你自己的上游模型（或用字符串 id 引用 `models.json`）；
 4. 重新运行 exe，服务即监听默认 `127.0.0.1:3166`；
 5. 客户端 `base_url` 填 `http://127.0.0.1:3166/v1`，`model` 填 `AutoRotate`。
+
+配置不在 exe 旁边？用 `--config` 指过去，`overrides.json` 和日志会跟随它所在目录：
+
+```powershell
+ModelRotator.exe --config D:\somewhere\config.json
+```
+
+**v1.1 起 exe 是自包含的**：代理 + 控制面（手动切换 / 快速刷新 / 赋权重）+ 进程与计划任务管理全在一个文件里，不再需要 `pythonw.exe`、`rotator-ctl.ps1` 或计划任务里那一串 python 路径。日常使用：
+
+```powershell
+ModelRotator.exe                 # 启动（无窗口，日志写 rotator.log）
+ModelRotator.exe --open-console  # 打开控制台
+ModelRotator.exe --status        # 看状态
+ModelRotator.exe --kill          # 全部关掉
+```
+
+要开机自启 + 保活，一条命令注册指向自己的计划任务（exe 有单实例保护，重复拉起会自动退出）：
+
+```powershell
+ModelRotator.exe --install-task
+```
 
 **GitHub Actions 自动发布**：打 `vX.Y.Z` 标签推送后，仓库的 `.github/workflows/release.yml` 会在 Windows runner 上跑测试 + 构建 exe + 创建 Release 并挂载 `ModelRotator.exe` 与 `config.example.json` 资产。
 
@@ -285,6 +307,101 @@ powershell -ExecutionPolicy Bypass -File rotator-ctl.ps1 testautostart # 停→�
 | `GET /status` 或 `/v1/rotator/status` | 完整快照：各模型所属账号与在途数、冷却剩余、成功/失败计数、距下次轮换秒数、`inflight_total` 与 `accounts` |
 | `GET /v1/models` | 只暴露一个 `expose_as` 模型，供客户端发现 |
 
+## 控制面：手动切换 / 快速刷新 / 赋权重（免重启）
+
+所有运行时操作都不需要重启进程、也不需要懂配置文件。三个入口按「可脚本化 → 可交互」排列：
+
+```powershell
+# 1) 命令行开关（不起服务，打给已在跑的实例）
+ModelRotator.exe --status                          # 状态总览
+ModelRotator.exe --list                            # 池内模型 + 权重 + 当前模型
+ModelRotator.exe --switch hy3                      # 手动切换模型
+ModelRotator.exe --next                            # 推进一个时间窗（跳到下一个）
+ModelRotator.exe --refresh                         # 快速刷新：重读配置重建路由池
+ModelRotator.exe --weight hy3=90 --weight deepseek=80   # 赋权重（可重复）
+ModelRotator.exe --disable m-x --enable m-y        # 池成员启停（可重复）
+ModelRotator.exe --clear-cooldown                  # 清掉全部冷却
+ModelRotator.exe --reset-settings                  # 删 overrides.json，回到 config.json 原状
+ModelRotator.exe --stop                            # 停止服务（保留计划任务）
+ModelRotator.exe --kill                            # 杀掉所有后台进程
+ModelRotator.exe --kill-all                        # 杀进程 + 注销计划任务
+ModelRotator.exe --install-task                    # 注册开机自启 + 5 分钟保活（指向本 exe）
+ModelRotator.exe --uninstall-task                  # 注销计划任务
+ModelRotator.exe --open-console                    # 浏览器打开控制台
+ModelRotator.exe --console                         # 保留控制台窗口跑服务
+ModelRotator.exe --config path\to\config.json      # 指定配置文件
+```
+
+```bash
+# 2) HTTP API（自动化用）
+curl -X POST http://127.0.0.1:3166/control/switch   -d '{"model":"hy3"}'
+curl -X POST http://127.0.0.1:3166/control/next
+curl -X POST http://127.0.0.1:3166/control/reload
+curl -X POST http://127.0.0.1:3166/control/weights  -d '{"scores":{"hy3":90,"deepseek":80}}'
+curl -X POST http://127.0.0.1:3166/control/enable   -d '{"model":"hy3"}'
+curl -X POST http://127.0.0.1:3166/control/disable  -d '{"model":"hy3"}'
+curl -X POST http://127.0.0.1:3166/control/clear-cooldown
+curl -X POST http://127.0.0.1:3166/control/settings -d '{"rotate_minutes":15}'
+curl -X POST http://127.0.0.1:3166/control/reset-settings
+curl -X POST http://127.0.0.1:3166/control/shutdown
+GET     http://127.0.0.1:3166/control/weights        # 权重全量快照
+GET     http://127.0.0.1:3166/control/settings       # 当前生效的运行时开关
+```
+
+```
+3) Web 控制台
+   http://127.0.0.1:3166/console     自包含 HTML，无外部依赖
+```
+
+控制台是一张表：每个模型一行，权重列可直接改数字，「保存权重」一次写回；
+行末有「切换」「停用/启用」；顶部有「下一个模型」「快速刷新」「清除冷却」；
+底部是运行时开关（轮换窗口、冷却时长、看门狗两个阈值、质量优先、对外模型名）
+和「恢复默认设置」「停止服务」。
+
+### 两个设计要点
+
+**手动切换为什么不会被质量优先抢回去。** 开了 `quality_priority` 后，
+`resolve()` 每次都重新挑「同等空闲里质量最高」的模型——不处理的话，用户刚
+切到一个低分模型，下一请求就被挑回高分那个，控制台上「切换」看起来毫无效果。
+所以 `switch` / `next` 会设一个 **pin**：本时间窗内钉住手动选择，只把「账号
+在途数」保留为第一排序键（并发摊开不能破），窗口自然到点后 pin 自动释放，
+交还轮换。`/status` 里的 `pinned` 字段能看到当前是否被钉住。
+
+**热重载为什么必须原子换 runtime。** `reload` 要换的是 `(cfg, state)` 这一对，
+不是两个独立全局。请求进来时先取快照，之后全程只用这一对；重载换的是全局引用，
+不影响已在跑的请求。若实现成「先换 cfg 再换 st」，重载瞬间的请求就会拿旧下标
+访问新池——越界或路由到不存在的模型。`tests/test_control_api.py` 里有
+「4 并发请求穿插 6 次重载」的专项用例盯着这件事。
+
+### 运行时设置层：`overrides.json`
+
+控制台/CLI 改动的设置落在 exe 同目录的 `overrides.json`，与「基础配置」
+`config.json` 分层：
+
+```
+effective = config.json  被  overrides.json  逐键覆盖
+```
+
+- 普通键：overrides 有就替换（窗口、冷却、看门狗阈值、`quality_priority` 等）；
+- `quality_scores`：**按模型 id 逐项合并**——改一个模型的权重不该把其余模型
+  冲回 config.json 的旧值；
+- `disabled_models` / `order`：结构性开关，直接作用于池成员。
+
+改坏了执行 `--reset-settings` 删掉 `overrides.json` 即回到 `config.json` 原状。
+`config.json` 仍是池结构、密钥、监听地址的唯一真相来源，控制台不碰它。
+
+### 配置丢失保护
+
+`config.json` 在 `.gitignore` 里、没有版本控制兜底，却是整个服务唯一的真相来源。
+误删之后，原来的 bootstrap 会照 `config.example.json` 生成一份**示例配置**
+（3 个假模型）——服务「正常启动」、日志无 ERROR，但池子整个变了，完全看不出
+哪里错了。现在有两条防线：
+
+1. **缺文件时先找备份**：按 mtime 取最新的 `config.json.bak*` 恢复，并大声告警；
+   只有真的没有备份才用示例模板。
+2. **启动时自动补备份**：读到的 `config.json` 与最新备份内容不一致就落一份
+   `config.json.bak-<时间戳>`；内容相同则不写（避免保活重启堆文件）。
+
 ## 探测模型真实能力
 
 上游网关 `/v1/models` 报的 `supports_tool_call` 经常不可信（有的标 `false` 实际能返回 `tool_calls`，有的标可用实际 404）。`probe_models.py` 逐个发真实工具调用请求，用实测结果决定能否进池：
@@ -311,7 +428,7 @@ python probe_models.py --agent2api http://127.0.0.1:9000/v1 --models-json /path/
 1. **端口别撞车**：被其它本地代理抢占的端口会返回它自己的 502（文案是 `upstream connect failed`），极易误判成本代理故障。换一个空闲端口。
 2. **进程必须被服务/计划任务持有**：用会话内 `Start-Process` 或后台任务启动的进程会随启动它的 shell 一起被回收，表现为「服务莫名消失」。用计划任务（Windows）或 systemd / nohup（*nix）持有。
 3. **重复代理环境变量**：环境同时有 `HTTPS_PROXY` 和 `https_proxy` 时，`Start-Process` 会抛 `Item has already been added`。`rotator-ctl.ps1` 在启动前清理重复变量。
-4. **计划任务必须用 `pythonw.exe`**：任务计划程序无法隐藏启动控制台程序（`python.exe`），会返回 `0x800710E0`。脚本直接跑 `pythonw.exe rotator.py`。
+4. **计划任务必须用 `pythonw.exe`**：任务计划程序无法隐藏启动控制台程序（`python.exe`），会返回 `0x800710E0`。脚本直接跑 `pythonw.exe rotator.py`。**exe 版没有这个问题**——exe 本身就是 GUI 子系统程序，计划任务可以直接跑。
 5. **SSL context 要装进 `HTTPSHandler`**：`OpenerDirector.open()` 不接受 `context` 参数，SSL context 必须装进 `HTTPSHandler(context=...)`，否则所有 POST 静默断开且 pythonw 无 stderr 不可见。
 6. **必须绕过环境代理**：urllib 默认读 `HTTP(S)_PROXY`，会把发往 `127.0.0.1` 的上游请求也绕出去导致连接被拒。已统一用 `ProxyHandler({})` 的 opener 直连。
 7. **透传时丢弃上游的 `Content-Length` / `Transfer-Encoding`**：由本层按实际转发方式重算，否则响应头冲突导致客户端解析异常。
@@ -323,6 +440,11 @@ python probe_models.py --agent2api http://127.0.0.1:9000/v1 --models-json /path/
     ```powershell
     python tests\live_concurrency_check.py     # 并发 3 个请求，断言落到 3 个不同账号
     ```
+13. **PyInstaller onefile 一次启动 = 两个进程**：父引导进程 + 子运行时进程，都叫 `ModelRotator.exe`。写「杀掉所有实例」的逻辑时必须同时排除 `os.getpid()` 和 `os.getppid()`，否则 `--kill` 会把自己刚启动的同胞兄弟杀掉，退出码变成 127。
+14. **按命令行枚举进程时，查询会匹配到自己**：`Get-CimInstance Win32_Process | ? {$_.CommandLine -match 'rotator\.py'}` 里，执行查询的 `powershell.exe` 自己的命令行就含 `rotator\.py` 字面量，会被算成一个「rotator 进程」。必须同时限定进程名（`python*` / `ModelRotator.exe`）。
+15. **`--noconsole` 打包后 `sys.stdout` 是 `None`**：`print()` 和 `logging.StreamHandler` 都会 `AttributeError`。源码版没人踩到是因为 stdout 一定存在；exe 版必须装静默 sink，否则首运行（要写 bootstrap 提示）就崩。
+16. **frozen exe 的 stdout 走 ANSI 代码页**：中文 Windows 上是 cp936，CLI 表格里的中文会变乱码（日志文件一直是 UTF-8，只有控制台不是）。启动时对流做一次 `reconfigure(encoding="utf-8")`。
+17. **配置丢失会被「优雅地」变成演示数据**：`config.json` 被 `.gitignore` 排除、没有版本控制兜底，而 bootstrap 在文件缺失时会照示例模板生成一份能跑但池子全错的配置。见上文「配置丢失保护」。
 
 ## 许可证
 

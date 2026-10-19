@@ -17,8 +17,22 @@ import rotator  # noqa: E402
 from rotator import State  # noqa: E402
 
 
+# 质量优先开关改由 State 构造参数传入（v1.1 热重载：State 整体重建，读自己
+# 构造时的值才不会和 cfg 版本错配）。测试随之改为显式传参。
+PRIORITY = {"on": True}
+
+
 def setup(priority=True):
-    rotator.CFG = {"quality_priority": priority}
+    PRIORITY["on"] = priority
+    return priority
+
+
+def mk_state(pool, priority=None, rotate_s=600, cooldown_s=0):
+    """构造 State；priority=None 表示跟随 setup() 的设定。"""
+    if priority is None:
+        priority = PRIORITY["on"]
+    return State(pool, rotate_s=rotate_s, cooldown_s=cooldown_s,
+                 rotate_on_first=True, quality_priority=priority)
 
 
 def pool_of(specs):
@@ -30,7 +44,7 @@ def test_prefers_higher_quality_when_idle():
     setup()
     # 全部不同账号、空闲：应选质量最高的
     pool = pool_of([("low", "A", 40), ("high", "B", 95), ("mid", "C", 70)])
-    st = State(pool, rotate_s=600, cooldown_s=0, rotate_on_first=True)
+    st = mk_state(pool)
     idx, _ = st.resolve("s1")
     assert pool[idx]["id"] == "high", pool[idx]["id"]
     print("OK idle -> highest quality:", pool[idx]["id"])
@@ -40,7 +54,7 @@ def test_account_load_beats_quality():
     setup()
     # high 质量最高，但它的账号已有在途请求 → 本次必须让给空闲账号
     pool = pool_of([("high", "A", 95), ("low", "B", 40)])
-    st = State(pool, rotate_s=600, cooldown_s=0, rotate_on_first=True)
+    st = mk_state(pool)
     i1, _ = st.resolve("s1")
     assert pool[i1]["id"] == "high"
     i2, _ = st.resolve("s2")          # high 的账号 A 已占用 1
@@ -51,7 +65,7 @@ def test_account_load_beats_quality():
 def test_quality_priority_off_uses_window_order():
     setup(priority=False)
     pool = pool_of([("a", "A", 10), ("b", "B", 99), ("c", "C", 50)])
-    st = State(pool, rotate_s=600, cooldown_s=0, rotate_on_first=True)
+    st = mk_state(pool)
     idx, _ = st.resolve("s1")
     assert idx == 0, idx     # 关掉质量优先后回到「从当前窗开始」的顺序
     print("OK priority off -> window order index", idx)
@@ -60,7 +74,7 @@ def test_quality_priority_off_uses_window_order():
 def test_quality_after_cooldown():
     setup()
     pool = pool_of([("best", "A", 99), ("ok2", "B", 60)])
-    st = State(pool, rotate_s=600, cooldown_s=60, rotate_on_first=True)
+    st = mk_state(pool, cooldown_s=60)
     i1, _ = st.resolve("s1")
     assert pool[i1]["id"] == "best"
     st.mark_fail(i1, "http_429")
@@ -74,7 +88,7 @@ def test_mid_quality_in_same_account_competes():
     setup()
     # 同账号两个模型质量不同、账号都空闲：B 账号里高分那个胜出
     pool = pool_of([("b_lo", "B", 50), ("b_hi", "B", 90), ("a_lo", "A", 30)])
-    st = State(pool, rotate_s=600, cooldown_s=0, rotate_on_first=True)
+    st = mk_state(pool)
     idx, _ = st.resolve("s1")
     assert pool[idx]["id"] == "b_hi", pool[idx]["id"]
     print("OK best within account ->", pool[idx]["id"])
@@ -83,7 +97,7 @@ def test_mid_quality_in_same_account_competes():
 def test_missing_quality_defaults_50():
     setup()
     pool = [{"id": "x", "account": "A"}, {"id": "y", "account": "B", "quality": 80}]
-    st = State(pool, rotate_s=600, cooldown_s=0, rotate_on_first=True)
+    st = mk_state(pool)
     idx, _ = st.resolve("s1")
     assert pool[idx]["id"] == "y", pool[idx]["id"]
     print("OK missing quality treated as 50 ->", pool[idx]["id"])
@@ -93,7 +107,7 @@ def test_concurrency_still_spreads_with_quality():
     setup()
     # 质量优先不能破坏并发摊开：4 个账号应摊 4 路
     pool = pool_of([("m%d" % i, "AC%d" % i, 90 - i * 5) for i in range(4)])
-    st = State(pool, rotate_s=600, cooldown_s=0, rotate_on_first=True)
+    st = mk_state(pool)
     got = [st.resolve("default")[0] for _ in range(4)]
     accts = [pool[i]["account"] for i in got]
     assert len(set(accts)) == 4, accts
