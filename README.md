@@ -317,7 +317,7 @@ ModelRotator.exe --status                          # 状态总览
 ModelRotator.exe --list                            # 池内模型 + 权重 + 当前模型
 ModelRotator.exe --switch hy3                      # 手动切换模型
 ModelRotator.exe --next                            # 推进一个时间窗（跳到下一个）
-ModelRotator.exe --refresh                         # 快速刷新：重读配置重建路由池
+ModelRotator.exe --refresh                         # 快速刷新：拉 agent2api 最新模型对齐池子 + 重载
 ModelRotator.exe --weight hy3=90 --weight deepseek=80   # 赋权重（可重复）
 ModelRotator.exe --disable m-x --enable m-y        # 池成员启停（可重复）
 ModelRotator.exe --clear-cooldown                  # 清掉全部冷却
@@ -336,7 +336,16 @@ ModelRotator.exe --config path\to\config.json      # 指定配置文件
 # 2) HTTP API（自动化用）
 curl -X POST http://127.0.0.1:3166/control/switch   -d '{"model":"hy3"}'
 curl -X POST http://127.0.0.1:3166/control/next
-curl -X POST http://127.0.0.1:3166/control/reload
+curl -X POST http://127.0.0.1:3166/control/reload   # = 上游同步 + 配置重载
+```
+
+**「快速刷新」做什么（v1.2）**：先请求上游网关的 `/v1/models`（按池内成员最多的
+同 url 组判定网关），把 config.json 的 pool 与其实时对齐——上游已下线的移除、
+新上架的加入（url/key 抄自同网关现有成员，`quality_scores` 按同族最高分继承、
+无先例 50），写回 config.json 并自动备份，随后重建路由立即生效。上游不可达时
+退化为纯配置重载，不会让刷新整体失败。不做逐模型探测（分钟级太慢），坏模型由
+失败转移 + 冷却兜底，也可在控制台手动停用；`sync_max_add` 可限制单次新增数
+（0 = 不限）。
 curl -X POST http://127.0.0.1:3166/control/weights  -d '{"scores":{"hy3":90,"deepseek":80}}'
 curl -X POST http://127.0.0.1:3166/control/enable   -d '{"model":"hy3"}'
 curl -X POST http://127.0.0.1:3166/control/disable  -d '{"model":"hy3"}'

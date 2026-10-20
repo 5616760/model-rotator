@@ -29,6 +29,7 @@ SUITES = [
     "test_account_affinity.py",
     "test_endpoints.py",
     "test_control_api.py",
+    "test_sync_refresh.py",
 ]
 
 

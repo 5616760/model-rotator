@@ -1107,7 +1107,7 @@ CONSOLE_HTML = r"""<!DOCTYPE html>
     <span class="hint" id="poolinfo"></span>
     <span style="flex:1"></span>
     <button id="btnNext">下一个模型 &#8594;</button>
-    <button id="btnReload">快速刷新</button>
+    <button id="btnReload" title="先从 agent2api /v1/models 拉取最新模型清单对齐池子（写回 config.json 并自动备份），再重载配置立即生效">快速刷新</button>
     <button id="btnCool">清除冷却</button>
     <button id="btnWeights" class="primary">保存权重</button>
   </div>
@@ -1942,12 +1942,205 @@ def effective_settings(cfg):
     return out
 
 
-def do_reload():
-    """快速刷新：重读 config.json + overrides.json，原子换 runtime。
+# --------------------------------------------------------------------------- sync  #
+# 快速刷新的「拉取」半边：把 config.json 的 pool 与上游网关 /v1/models 对齐。
+# 口径与 sync_pool.py 一致（家族归并、账号推断、同族最高分继承），但这里是
+# 在线版——不依赖 probe_result.json 离线探测产物，刷新即拉取，无需重启。
+SYNC_PREFIXES = ("wb-", "wai-", "catpaw-", "sn-", "qoder-")
+SYNC_SUFFIXES = ("-solo", "-lite", "-free", "-preview")
+SYNC_LOCK = threading.Lock()    # 刷新可能并发触发（控制台按钮 + CLI），写回要互斥
 
-    失败时保留旧 runtime 继续服务——配置文件写坏不该让代理挂掉。
+
+def _sync_bare(mid):
+    """去掉 @account 后缀，取纯模型 id。"""
+    mid = str(mid)
+    return mid.rsplit("@", 1)[0] if "@" in mid else mid
+
+
+def _sync_family(mid):
+    """同族归并：去入口前缀、循环剥修饰后缀、吞单字母分片后缀（hy3-b/c）。
+
+    与 sync_pool.py 完全同口径——新模型的质量分继承靠它找同族先例。
+    """
+    x = _sync_bare(mid)
+    for p in SYNC_PREFIXES:
+        if x.startswith(p):
+            x = x[len(p):]
+            break
+    changed = True
+    while changed:
+        changed = False
+        for s in SYNC_SUFFIXES:
+            if x.endswith(s) and len(x) > len(s):
+                x = x[: -len(s)]
+                changed = True
+        if re.search(r"-[a-z]$", x) and len(x) > 3:
+            x = x[:-2]
+            changed = True
+    return x.lower().replace(".", "-")
+
+
+def _sync_account(mid):
+    """按已知前缀推断账号标签（只影响并发分片，不影响鉴权）。同 sync_pool.py。"""
+    m = _sync_bare(mid)
+    if m.startswith("wb-"):
+        return "wb"
+    if m.startswith("wai-"):
+        return "wai"
+    if m.startswith("catpaw-") or m.startswith("LongCat"):
+        return "tt"
+    if m.startswith("qoder-") or m.startswith("Qwen3."):
+        return "qoder"
+    if m.startswith("sn-") or m.startswith("sensenova-"):
+        return "raccoon"
+    if m.startswith("hy3"):
+        # hy3-b / hy3-c 是同模型的不同账号副本，必须各自分桶，否则并发被当成
+        # 同一资源串行
+        return m
+    if m.endswith("-solo"):
+        return "trae"
+    if m.endswith("-free"):
+        return "free"
+    return m
+
+
+def sync_pool_from_upstream():
+    """从上游网关拉 /v1/models，对齐 config.json 的 pool 并写回（先备份）。
+
+    口径：
+      - 只动「与被查上游同 url」的成员，其他网关的成员一律不碰；
+      - 上游清单里已消失的成员移除（网关下线，永久失效）；
+      - 上游有而池里没有的加入：url/key 抄自同网关现有成员（密钥机制不复制改写），
+        account 按前缀推断，quality_scores 按同族最高分继承、无先例给 50；
+      - 上游不可达 / 清单为空时抛异常，由调用方决定退化为纯配置重载。
+
+    为什么不做逐模型探测：探测 30 个模型要分钟级，不适合放在刷新按钮里；
+    坏模型交给 rotator 自身的失败转移 + 冷却兜底，用户可在控制台手动停用。
+    可用 config.json 的 sync_max_add 限制单次新增数（0 = 不限）。
+    """
+    with SYNC_LOCK:
+        raw = load_raw(DEFAULT_CFG)
+        pool = raw.get("pool") or []
+        # 同网关成员按 url 分组，取成员最多的组作为同步对象（池可以混接多个网关）
+        groups = {}
+        for e in pool:
+            if isinstance(e, dict) and e.get("url"):
+                groups.setdefault(e["url"], []).append(e)
+        if not groups:
+            return {"ok": False, "error": "池内没有可同步的内联成员（全是字符串引用）"}
+        sync_url, members = max(groups.items(), key=lambda kv: len(kv[1]))
+
+        u = sync_url.rstrip("/")
+        if u.endswith("/chat/completions"):
+            u = u[: -len("/chat/completions")]
+        models_url = u + "/models"
+
+        # 鉴权：优先用 runtime 里已解析的 key（同网关第一个非空者）
+        key = ""
+        cfg_now, _ = current_runtime()
+        if cfg_now:
+            for m in cfg_now["_pool"]:
+                if m["url"].startswith(u) and m.get("key"):
+                    key = m["key"]
+                    break
+        req = urllib.request.Request(models_url)
+        if key:
+            req.add_header("Authorization", "Bearer " + key)
+        try:
+            with urlopen_direct(req, timeout=10) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            raise RuntimeError("上游模型清单不可达 %s: %s" % (models_url, e))
+        upstream = [m["id"] for m in data.get("data", [])
+                    if isinstance(m, dict) and m.get("id")]
+        if not upstream:
+            raise RuntimeError("上游 /v1/models 返回空清单: %s" % models_url)
+        up_set = set(upstream)
+
+        # 哪些成员归这次同步管：dict 条目按自身 url；字符串引用按 runtime 解析
+        # 出的 url（它们指向 models.json，同网关才参与增删判定）
+        resolved_url = {}
+        if cfg_now:
+            for m in cfg_now["_pool"]:
+                resolved_url.setdefault(_sync_bare(m["id"]), m["url"])
+
+        def governed(e):
+            if isinstance(e, dict):
+                return e.get("url") == sync_url
+            return resolved_url.get(_sync_bare(e)) == sync_url
+
+        kept, removed, kept_bares = [], [], set()
+        for e in pool:
+            b = _sync_bare(e.get("id", "") if isinstance(e, dict) else e)
+            if governed(e) and b not in up_set:
+                removed.append(b)           # 上游清单已无此模型
+                continue
+            kept.append(e)
+            kept_bares.add(b)
+
+        # 新增：上游有而池里没有。抄同组现有成员的鉴权写法，不另起炉灶。
+        max_add = int(raw.get("sync_max_add") or 0)
+        add_all = sorted((mid for mid in up_set if mid not in kept_bares),
+                         key=lambda m: (_sync_family(m), m))
+        added = add_all if not max_add else add_all[:max_add]
+        skipped = add_all[len(added):] if max_add else []
+
+        if not added and not removed:
+            return {"ok": True, "upstream_n": len(upstream), "added": [],
+                    "removed": [], "skipped": [], "url": models_url,
+                    "message": "池已与上游一致（%d 个模型）" % len(upstream)}
+
+        scores = dict(raw.get("quality_scores") or {})
+        for mid in added:
+            fam = _sync_family(mid)
+            cand = [s for k, s in scores.items() if _sync_family(k) == fam]
+            scores[mid] = max(cand) if cand else 50.0
+
+        template = members[0]
+        new_entries = []
+        for mid in added:
+            e = {"id": mid, "url": template["url"],
+                 "account": _sync_account(mid)}
+            if template.get("key_from"):
+                e["key_from"] = template["key_from"]
+            if template.get("key"):
+                e["key"] = template["key"]
+            new_entries.append(e)
+
+        raw["pool"] = kept + new_entries
+        if added:
+            raw["quality_scores"] = scores
+        bak = "%s.bak-%s" % (DEFAULT_CFG, time.strftime("%Y%m%d-%H%M%S"))
+        try:
+            shutil.copy2(DEFAULT_CFG, bak)
+        except OSError as e:
+            log.warning("config.json 备份失败（继续写回）: %s", e)
+            bak = None
+        with open(DEFAULT_CFG, "w", encoding="utf-8") as f:
+            json.dump(raw, f, ensure_ascii=False, indent=2)
+        log.info("上游同步完成: %s 池 %d -> %d（+%d / -%d）备份=%s",
+                 models_url, len(pool), len(raw["pool"]),
+                 len(added), len(removed), os.path.basename(bak) if bak else "无")
+        return {"ok": True, "upstream_n": len(upstream), "added": added,
+                "removed": removed, "skipped": skipped, "url": models_url,
+                "backup": os.path.basename(bak) if bak else None,
+                "message": "已同步上游 %d 个模型（新增 %d / 移除 %d）"
+                           % (len(upstream), len(added), len(removed))}
+
+
+def do_reload():
+    """快速刷新：先从上游拉最新模型清单对齐池子，再重读配置原子换 runtime。
+
+    上游不可达时退化为纯配置重载——刷新按钮不该因为 agent2api 临时抽风
+    就整体失败。失败时保留旧 runtime 继续服务——配置文件写坏不该让代理挂掉。
     在途请求不受影响：它们手里是旧 (cfg, st) 引用，跑完自己释放。
     """
+    sync_info = None
+    try:
+        sync_info = sync_pool_from_upstream()
+    except Exception as e:
+        log.warning("上游同步失败，退化为纯配置重载: %s", e)
+        sync_info = {"ok": False, "error": str(e)}
     try:
         cfg = build_config()
         st = State(
@@ -1961,10 +2154,10 @@ def do_reload():
         )
     except SystemExit as e:
         log.error("重载失败，沿用旧配置: %s", e)
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), "sync": sync_info}
     except Exception as e:
         log.error("重载异常，沿用旧配置: %s", e)
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), "sync": sync_info}
     _, old_st = current_runtime()
     old_pool = [m["id"] for m in old_st.pool] if old_st else []
     new_pool = [m["id"] for m in cfg["_pool"]]
@@ -1973,10 +2166,16 @@ def do_reload():
     install_runtime(cfg, st)
     log.info("快速刷新完成: 池 %d -> %d（新增 %d / 移除 %d）",
              len(old_pool), len(new_pool), len(added), len(removed))
-    return {"ok": True, "action": "reload", "pool_size": len(new_pool),
-            "added": added, "removed": removed, "active": st.current(),
-            "message": "已重载配置，池 %d -> %d（+%d / -%d）"
-                       % (len(old_pool), len(new_pool), len(added), len(removed))}
+    result = {"ok": True, "action": "reload", "pool_size": len(new_pool),
+              "added": added, "removed": removed, "active": st.current(),
+              "sync": sync_info,
+              "message": "已重载配置，池 %d -> %d（+%d / -%d）"
+                         % (len(old_pool), len(new_pool), len(added), len(removed))}
+    if sync_info and sync_info.get("ok"):
+        result["message"] += "；" + sync_info["message"]
+    elif sync_info and sync_info.get("error"):
+        result["message"] += "（上游同步失败: %s）" % sync_info["error"]
+    return result
 
 
 def setup_crash_log():
